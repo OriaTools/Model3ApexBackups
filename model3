@@ -1,0 +1,289 @@
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.SuperDom;
+using NinjaTrader.Gui.Tools;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.Core.FloatingPoint;
+using NinjaTrader.NinjaScript.Indicators;
+using NinjaTrader.NinjaScript.DrawingTools;
+#endregion
+
+#region Using declarations
+using System;
+using System.ComponentModel.DataAnnotations;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Indicators;
+#endregion
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class M3 : Strategy
+    {
+        private EMA fastEMA, slowEMA;
+        private RSI rsi;
+        private Random rand = new Random();
+
+        private DateTime currentDay = DateTime.MinValue;
+        private DateTime lastDebugPrint = DateTime.MinValue;
+
+        private double dayStartEquity = 0;
+        private double peakEquity = 0;
+
+        // ===========================================
+        // USER PARAMETERS
+        // ===========================================
+
+        [NinjaScriptProperty]
+        [Display(Name = "Account Size ($)", GroupName = "Risk")]
+        public double AccountSize { get; set; } = 100000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Daily Loss ($)", GroupName = "Risk")]
+        public double MaxDailyLoss { get; set; } = 3400;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Base Contracts", GroupName = "Sizing")]
+        public int BaseContracts { get; set; } = 8;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Contracts", GroupName = "Sizing")]
+        public int MaxContracts { get; set; } = 70;
+
+        // ===========================================
+        // STATE
+        // ===========================================
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name = "M3";
+                Description = "Ultra HF Model-3 with forced reset + diagnostics";
+                Calculate = Calculate.OnEachTick;
+
+                EntriesPerDirection = 999;
+                EntryHandling = EntryHandling.AllEntries;
+
+                IsExitOnSessionCloseStrategy = true;
+                ExitOnSessionCloseSeconds = 30;
+            }
+            else if (State == State.DataLoaded)
+            {
+                fastEMA = EMA(9);
+                slowEMA = EMA(21);
+                rsi     = RSI(14, 3);
+            }
+        }
+
+        // ===========================================
+        // MAIN LOOP
+        // ===========================================
+
+        protected override void OnBarUpdate()
+        {
+            if (CurrentBar < 50)
+                return;
+
+            double equity = GetEquitySafe();
+
+            // ===========================================
+            // DAILY & ENABLE RESET (ALWAYS FIRES)
+            // ===========================================
+
+            if (currentDay == DateTime.MinValue || Time[0].Date != currentDay.Date)
+            {
+                currentDay = Time[0].Date;
+                dayStartEquity = equity;
+                peakEquity = equity;
+
+                Print($"[Amelia ULTRA] RESET | Day: {currentDay:yyyy-MM-dd} | Equity: {equity:C}");
+            }
+
+            if (equity > peakEquity)
+                peakEquity = equity;
+
+            // ===========================================
+            // KILL SWITCH (Apex safe)
+            // ===========================================
+
+            // Hard daily rule
+            if (equity <= dayStartEquity - MaxDailyLoss)
+            {
+                Print($"[Amelia ULTRA] DAILY STOP | Equity: {equity:C}");
+                Flatten();
+                return;
+            }
+
+            // Peak drawdown rule (buffer)
+            if (equity <= peakEquity - 3000)
+            {
+                Print($"[Amelia ULTRA] PEAK STOP | Equity: {equity:C}");
+                Flatten();
+                return;
+            }
+
+            // No new entries after 15:59 CT
+            if (ToTime(Time[0]) >= 155900)
+                return;
+
+            int qty = GetQuantity(equity);
+
+            // ===========================================
+            // SIGNAL ENGINE — HIGH FREQUENCY
+            // ===========================================
+
+            double mood = fastEMA[0] - slowEMA[0];
+            double volBase = SMA(Volume, 20)[0];
+            if (volBase <= 0) return;
+
+            double volSpike = Volume[0] / volBase;
+            double random = rand.NextDouble();
+
+            bool goLong  = (mood > 0.05) && (rsi[0] > 45) && (volSpike > 1.2) && (random > 0.50);
+            bool goShort = (mood < -0.05) && (rsi[0] < 55) && (volSpike > 1.2) && (random > 0.50);
+
+            // ===========================================
+            // ENTRIES
+            // ===========================================
+
+            if (Position.MarketPosition == MarketPosition.Flat)
+            {
+                if (goLong)
+                {
+                    Print($"[ULTRA] LONG {qty} @ {Close[0]}");
+                    EnterLong(qty, "Amelia");
+                }
+                else if (goShort)
+                {
+                    Print($"[ULTRA] SHORT {qty} @ {Close[0]}");
+                    EnterShort(qty, "Amelia");
+                }
+            }
+
+            // ===========================================
+            // EXITS — PARTIAL + TRAIL
+            // ===========================================
+
+            if (Position.MarketPosition == MarketPosition.Long &&
+                Close[0] >= Position.AveragePrice + 12 * TickSize)
+            {
+                int partial = Math.Max(1, Position.Quantity / 2);
+
+                ExitLong(partial, "Partial", "Amelia");
+                if (Position.Quantity - partial > 0)
+                {
+                    ExitLongStopMarket(Position.Quantity - partial,
+                        Position.AveragePrice + 4 * TickSize,
+                        "Trail", "Amelia");
+                }
+            }
+
+            if (Position.MarketPosition == MarketPosition.Short &&
+                Close[0] <= Position.AveragePrice - 12 * TickSize)
+            {
+                int partial = Math.Max(1, Position.Quantity / 2);
+
+                ExitShort(partial, "Partial", "Amelia");
+                if (Position.Quantity - partial > 0)
+                {
+                    ExitShortStopMarket(Position.Quantity - partial,
+                        Position.AveragePrice - 4 * TickSize,
+                        "Trail", "Amelia");
+                }
+            }
+
+            // ===========================================
+            // DIAGNOSTICS EVERY 30 SECONDS
+            // ===========================================
+
+            if ((DateTime.Now - lastDebugPrint).TotalSeconds > 30)
+            {
+                Print($"[ULTRA] Alive | Eq:{equity:C} Mood:{mood:F2} RSI:{rsi[0]:F1} Vol:{volSpike:F2} Qty:{qty}");
+                lastDebugPrint = DateTime.Now;
+            }
+        }
+
+        // ===========================================
+        // SAFE EQUITY GETTER (NEVER THROWS)
+        // ===========================================
+
+        private double GetEquitySafe()
+        {
+            double cash = AccountSize;
+            double realized = 0;
+            double unreal = 0;
+
+            try { cash = Account.Get(AccountItem.CashValue, Currency.UsDollar); }
+            catch { }
+
+            try { realized = Account.Get(AccountItem.GrossRealizedProfitLoss, Currency.UsDollar); }
+            catch
+            {
+                realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+            }
+
+            if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                try { unreal = Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency, Close[0]); }
+                catch { unreal = 0; }
+            }
+
+            double total = cash + realized + unreal;
+
+            // Never return NaN
+            if (double.IsNaN(total) || double.IsInfinity(total))
+                return cash + realized;
+
+            return total;
+        }
+
+        // ===========================================
+        // ORDER SIZING
+        // ===========================================
+
+        private int GetQuantity(double equity)
+        {
+            double riskPerTrade = equity * 0.004;
+            double perContract = 12 * Instrument.MasterInstrument.PointValue;
+
+            if (perContract <= 0)
+                return BaseContracts;
+
+            int qty = (int)(riskPerTrade / perContract);
+
+            qty = Math.Max(BaseContracts, qty);
+            qty = Math.Min(MaxContracts, qty);
+
+            return qty;
+        }
+
+        // ===========================================
+        // FLATTEN HELPER
+        // ===========================================
+
+        private void Flatten()
+        {
+            if (Position.MarketPosition == MarketPosition.Long)
+                ExitLong();
+
+            if (Position.MarketPosition == MarketPosition.Short)
+                ExitShort();
+        }
+    }
+}
