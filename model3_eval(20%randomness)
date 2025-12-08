@@ -8,14 +8,12 @@ using NinjaTrader.NinjaScript.Indicators;
 #endregion
 
 // =======================================================
-//  M3_Eval — AMELIA MODEL 3 (APEX EVALUATION EDITION)
-//  • Original M3 engine (mood + RSI + volume spike)
-//  • 20% randomness filter (still has the M3 "soul")
-//  • Daily loss guard + daily profit cap
-//  • Max trades / day
-//  • Time window 09:30–16:00
-//  • Optional VIX crash brake (^VIX, minute bars)
-//  • SAFE brackets with SetStopLoss / SetProfitTarget
+//  M3_Eval — APEX EVAL EDITION (B)
+//  • Original M3 signal engine (mood + RSI + volume) — NO randomness
+//  • Fixed contracts (BaseContracts) for consistency
+//  • Daily loss + daily profit cap + max trades per day
+//  • Optional VIX crash brake via ^VIX 1m secondary series
+//  • Time window + time stop
 // =======================================================
 
 namespace NinjaTrader.NinjaScript.Strategies
@@ -28,6 +26,23 @@ namespace NinjaTrader.NinjaScript.Strategies
         private EMA fastEMA;
         private EMA slowEMA;
         private RSI rsi;
+
+        // -----------------------------
+        // CRASH BRAKE / VIX
+        // -----------------------------
+        private double vixLast = 0;
+        private bool   vixTriggered = false;
+
+        // -----------------------------
+        // USER PARAMETERS – CRASH BRAKE
+        // -----------------------------
+        [NinjaScriptProperty]
+        [Display(Name = "Use VIX Crash Brake", GroupName = "Crash Brake", Order = 0)]
+        public bool UseVixCrashBrake { get; set; } = false;
+
+        [NinjaScriptProperty]
+        [Display(Name = "VIX Panic Threshold", GroupName = "Crash Brake", Order = 1)]
+        public double VixPanicThreshold { get; set; } = 28.0;
 
         // -----------------------------
         // USER PARAMETERS – ORDERS
@@ -76,47 +91,31 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Display(Name = "Session Start (HHmmss)", GroupName = "Session", Order = 1)]
-        public int SessionStart { get; set; } = 93000;  // 9:30:00
+        public int SessionStart { get; set; } = 93000;  // 09:30:00
 
         [NinjaScriptProperty]
         [Display(Name = "Session End (HHmmss)", GroupName = "Session", Order = 2)]
         public int SessionEnd { get; set; } = 160000;  // 16:00:00
 
         // -----------------------------
-        // USER PARAMETERS – CRASH BRAKE
-        // -----------------------------
-        [NinjaScriptProperty]
-        [Display(Name = "Use VIX Crash Brake", GroupName = "Crash Brake", Order = 0)]
-        public bool UseVixBrake { get; set; } = false;
-
-        [NinjaScriptProperty]
-        [Display(Name = "VIX Panic Threshold", GroupName = "Crash Brake", Order = 1)]
-        public double VixThreshold { get; set; } = 28.0;
-
-        // -----------------------------
         // INTERNAL STATE
         // -----------------------------
-        private DateTime currentDay         = Core.Globals.MinDate;
-        private double   dayStartEquity     = 0;
-        private double   dayMaxEquity       = 0;
-        private int      tradesToday        = 0;
+        private DateTime currentDay      = Core.Globals.MinDate;
+        private double   dayStartEquity  = 0;
+        private double   dayMaxEquity    = 0;
+        private int      tradesToday     = 0;
 
         private bool dailyLossHit   = false;
         private bool dailyProfitHit = false;
         private bool tradeLimitHit  = false;
 
-        private DateTime lastEntryTime      = Core.Globals.MinDate;
+        private DateTime lastEntryTime = Core.Globals.MinDate;
 
-        // Used for one-time prints
+        // One-time prints
         private bool printedDailyLoss   = false;
         private bool printedDailyProfit = false;
         private bool printedTradeLimit  = false;
-
-        // VIX state
-        private double vixNow = 0;
-
-        // Random engine for M3 personality (20% randomness)
-        private Random rand = new Random();
+        private bool printedVixBrake    = false;
 
         // =======================================================
         //  STATE CHANGE
@@ -125,35 +124,28 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (State == State.SetDefaults)
             {
-                Name        = "M3_Eval";
-                Description = "Model 3 Apex Evaluation Edition — original engine + eval safety.";
+                Name = "M3_Eval";
+                Description = "Model 3 Eval Edition — original signal engine, fixed size, eval-safe guards.";
 
-                Calculate           = Calculate.OnEachTick;
+                Calculate = Calculate.OnEachTick;
                 EntriesPerDirection = 1;
-                EntryHandling       = EntryHandling.AllEntries;
+                EntryHandling = EntryHandling.AllEntries;
 
                 IsExitOnSessionCloseStrategy = false;
-                ExitOnSessionCloseSeconds    = 0;
-                TimeInForce                  = TimeInForce.Day;
+                ExitOnSessionCloseSeconds = 0;
+                TimeInForce = TimeInForce.Day;
 
-                // In eval I prefer to keep the strategy running if
-                // we get occasional rejections
-                RealtimeErrorHandling  = RealtimeErrorHandling.IgnoreAllErrors;
+                RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
                 ConnectionLossHandling = ConnectionLossHandling.KeepRunning;
-                TraceOrders            = true;
+                TraceOrders = true;
             }
             else if (State == State.Configure)
             {
-                // Optional VIX secondary series
-                if (UseVixBrake)
-                {
-                    // Adjust "^VIX" to whatever your feed uses if needed
-                    AddDataSeries("^VIX", BarsPeriodType.Minute, 1, MarketDataType.Last);
-                }
+                // Secondary series for VIX crash brake (if data is available)
+                AddDataSeries("^VIX", BarsPeriodType.Minute, 1, MarketDataType.Last);
             }
             else if (State == State.DataLoaded)
             {
-                // Match original M3
                 fastEMA = EMA(9);
                 slowEMA = EMA(21);
                 rsi     = RSI(14, 3);
@@ -169,19 +161,18 @@ namespace NinjaTrader.NinjaScript.Strategies
         // =======================================================
         protected override void OnBarUpdate()
         {
-            // Handle VIX secondary series first
-            if (UseVixBrake && BarsInProgress == 1)
+            // Handle VIX series updates
+            if (BarsInProgress == 1)
             {
-                // VIX minute bars
-                vixNow = Close[0];
+                vixLast = Closes[1][0];
                 return;
             }
 
-            // Only operate main logic on primary series
+            // Only trade on primary MNQ series
             if (BarsInProgress != 0)
                 return;
 
-            if (CurrentBar < 60)
+            if (CurrentBar < 50)
                 return;
 
             // -------- DAILY RESET --------
@@ -196,48 +187,43 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
 
             // -------- VIX CRASH BRAKE --------
-            if (UseVixBrake && vixNow > VixThreshold)
+            if (UseVixCrashBrake && vixLast > VixPanicThreshold)
             {
-                if (Position.MarketPosition != MarketPosition.Flat)
-                    SafeFlatten("VIX_BRAKE");
+                if (!printedVixBrake)
+                {
+                    Print(string.Format("[M3_Eval] VIX CRASH BRAKE — VIX={0:F2} > {1:F2}. Flatten & halt.",
+                        vixLast, VixPanicThreshold));
+                    printedVixBrake = true;
+                }
 
-                return; // no new entries when VIX in panic
+                SafeFlatten();
+                return;
             }
 
             // -------- RISK GUARDS --------
             if (IsTradingHaltedForToday())
                 return;    // nothing further today
 
-            // -------- NO NEW ENTRIES AFTER 15:59 (like original) --------
-            if (ToTime(Time[0]) >= 155900)
-                return;
-
             // ===================================================
-            //  >>> ORIGINAL M3 ENGINE (with 20% randomness) <<<
+            //  ORIGINAL M3 SIGNAL ENGINE (NO RANDOMNESS)
             // ===================================================
+            double mood = fastEMA[0] - slowEMA[0];
 
-            double mood    = fastEMA[0] - slowEMA[0];
             double volBase = SMA(Volume, 20)[0];
             if (volBase <= 0)
                 return;
 
             double volSpike = Volume[0] / volBase;
-            double random   = rand.NextDouble();     // 0–1
 
-            // Keep personality but soften randomness:
-            // original: random > 0.50
-            // here:     random > 0.20  (blocks ~20% of signals)
-            bool longSignal =
+            bool goLong =
                 (mood > 0.05) &&
                 (rsi[0] > 45) &&
-                (volSpike > 1.2) &&
-                (random > 0.20);
+                (volSpike > 1.2);
 
-            bool shortSignal =
+            bool goShort =
                 (mood < -0.05) &&
                 (rsi[0] < 55) &&
-                (volSpike > 1.2) &&
-                (random > 0.20);
+                (volSpike > 1.2);
 
             // Only 1 position at a time
             if (Position.MarketPosition == MarketPosition.Flat)
@@ -245,14 +231,13 @@ namespace NinjaTrader.NinjaScript.Strategies
                 if (tradesToday >= MaxTradesPerDay)
                     return;
 
-                if (longSignal)
+                if (goLong)
                 {
-                    // Brackets: 22 / 40 ticks, no partials in eval
                     SetStopLoss("Amelia", CalculationMode.Ticks, StopTicks, false);
                     SetProfitTarget("Amelia", CalculationMode.Ticks, TargetTicks);
                     EnterLong(BaseContracts, "Amelia");
                 }
-                else if (shortSignal)
+                else if (goShort)
                 {
                     SetStopLoss("Amelia", CalculationMode.Ticks, StopTicks, false);
                     SetProfitTarget("Amelia", CalculationMode.Ticks, TargetTicks);
@@ -282,21 +267,29 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (execution == null || execution.Order == null)
                 return;
 
+            if (execution.Order.OrderState != OrderState.Filled)
+                return;
+
             // Count each *filled entry* as one trade
-            if (execution.Order.OrderState == OrderState.Filled &&
-                execution.Order.Name == "Amelia" &&
-                (execution.Order.OrderAction == OrderAction.Buy || execution.Order.OrderAction == OrderAction.SellShort))
+            if (execution.Order.Name == "Amelia" &&
+                (execution.Order.OrderAction == OrderAction.Buy ||
+                 execution.Order.OrderAction == OrderAction.SellShort))
             {
                 tradesToday++;
-                lastEntryTime = execution.Time;
+                lastEntryTime = time;
 
-                Print($"[M3_Eval TRADE COUNT] {Times[0][0]} — tradesToday = {tradesToday}");
+                Print(string.Format("[M3_Eval] Trade count updated: {0}", tradesToday));
             }
+
+            // Reset lastEntryTime when flat
+            if (Position.MarketPosition == MarketPosition.Flat)
+                lastEntryTime = Core.Globals.MinDate;
         }
 
         // =======================================================
         //  DAILY STATE & GUARDS
         // =======================================================
+
         private void UpdateDailyState()
         {
             DateTime barDate = Times[0][0].Date;
@@ -317,8 +310,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 printedDailyLoss   = false;
                 printedDailyProfit = false;
                 printedTradeLimit  = false;
+                printedVixBrake    = false;
 
-                Print($"[M3_Eval DAY RESET] {currentDay:yyyy-MM-dd} — StartEquity = {dayStartEquity:F2}");
+                Print(string.Format("[M3_Eval] DAY RESET {0:yyyy-MM-dd} — StartEquity = {1:F2}",
+                    currentDay, dayStartEquity));
             }
 
             double currentEquity = GetEquitySafe();
@@ -329,7 +324,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool IsTradingHaltedForToday()
         {
             double currentEquity = GetEquitySafe();
-            double dayPnL        = currentEquity - dayStartEquity;
+            double dayPnL = currentEquity - dayStartEquity;
 
             // Daily loss
             if (!dailyLossHit && dayPnL <= -Math.Abs(MaxDailyLoss))
@@ -337,7 +332,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyLossHit = true;
                 if (!printedDailyLoss)
                 {
-                    Print($"[M3_Eval GUARD] Daily loss hit. PnL={dayPnL:F2}, limit={-Math.Abs(MaxDailyLoss):F2}. No more trades today.");
+                    Print(string.Format("[M3_Eval] GUARD: Daily loss hit. PnL={0:F2}, limit={1:F2}.",
+                        dayPnL, -Math.Abs(MaxDailyLoss)));
                     printedDailyLoss = true;
                 }
             }
@@ -348,7 +344,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 dailyProfitHit = true;
                 if (!printedDailyProfit)
                 {
-                    Print($"[M3_Eval GUARD] Daily profit cap reached. PnL={dayPnL:F2}, cap={Math.Abs(MaxDailyProfit):F2}. Locking in gains.");
+                    Print(string.Format("[M3_Eval] GUARD: Daily profit cap reached. PnL={0:F2}, cap={1:F2}.",
+                        dayPnL, Math.Abs(MaxDailyProfit)));
                     printedDailyProfit = true;
                 }
             }
@@ -359,7 +356,8 @@ namespace NinjaTrader.NinjaScript.Strategies
                 tradeLimitHit = true;
                 if (!printedTradeLimit)
                 {
-                    Print($"[M3_Eval GUARD] Max trades per day reached ({tradesToday}/{MaxTradesPerDay}). No more entries today.");
+                    Print(string.Format("[M3_Eval] GUARD: Max trades per day reached ({0}/{1}).",
+                        tradesToday, MaxTradesPerDay));
                     printedTradeLimit = true;
                 }
             }
@@ -367,38 +365,52 @@ namespace NinjaTrader.NinjaScript.Strategies
             return dailyLossHit || dailyProfitHit || tradeLimitHit;
         }
 
-        // -------------------------------------------------------
-        //  EQUITY HELPER (real cash if possible, else synthetic)
-        // -------------------------------------------------------
+        // =======================================================
+        //  EQUITY HELPER: cash + realized + unrealized PnL
+        // =======================================================
         private double GetEquitySafe()
         {
+            double equity = AccountSize;
+
             try
             {
                 if (Account != null)
                 {
                     double cash = Account.Get(AccountItem.CashValue, Currency.UsDollar);
                     if (!double.IsNaN(cash) && !double.IsInfinity(cash) && cash > 0)
-                        return cash;
+                        equity = cash;
                 }
             }
             catch
             {
-                // fall through
+                // fall back to synthetic equity
             }
 
-            double stratPnL = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
-            return AccountSize + stratPnL;
+            double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+            double unreal   = 0;
+
+            try
+            {
+                unreal = Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency);
+                if (double.IsNaN(unreal) || double.IsInfinity(unreal))
+                    unreal = 0;
+            }
+            catch
+            {
+                unreal = 0;
+            }
+
+            return equity + realized + unreal;
         }
 
-        // -------------------------------------------------------
+        // =======================================================
         //  SAFE FLATTEN
-        // -------------------------------------------------------
-        private void SafeFlatten(string reason)
+        // =======================================================
+        private void SafeFlatten()
         {
-            Print($"[M3_Eval FLATTEN] Reason={reason}");
-
-            try { ExitLong(reason, "Amelia"); }  catch { }
-            try { ExitShort(reason, "Amelia"); } catch { }
+            try { ExitLong("Flat", "Amelia"); }  catch { }
+            try { ExitShort("Flat", "Amelia"); } catch { }
         }
     }
 }
+
