@@ -1,0 +1,320 @@
+#region Using declarations
+using System;
+using System.ComponentModel.DataAnnotations;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Indicators;
+#endregion
+
+// ==================================================================
+// M3_Ultra_v2 — ORIGINAL ULTRA + EVAL-SAFE HOURS + PROFIT-LOCK
+//  • Original M3 "Ultra" entry logic (EMA + RSI + volume + randomness)
+//  • 9:30–16:00 only (ET) — no premarket, no post-close chop
+//  • Daily loss kill switch (MaxDailyLoss)
+//  • Peak drawdown from high-watermark kill switch (hard-coded $3,000)
+//  • Day-level profit lock via high-watermark
+//  • Partial profit + breakeven-style trailing stop
+//  • Safer stop logic (never places stop orders above/below market)
+// ==================================================================
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class M3_Ultra_v2 : Strategy
+    {
+        private EMA fastEMA, slowEMA;
+        private RSI rsi;
+        private Random rand = new Random();
+
+        private DateTime currentDay = DateTime.MinValue;
+        private DateTime lastDebugPrint = DateTime.MinValue;
+
+        private double dayStartEquity = 0;
+        private double dayHighWatermark = 0;   // ratchets up when in profit
+        private bool profitLockedToday = false;
+
+        // ==========================================================
+        // USER PARAMETERS
+        // ==========================================================
+        [NinjaScriptProperty]
+        [Display(Name = "Account Size ($)", GroupName = "Risk", Order = 0)]
+        public double AccountSize { get; set; } = 100000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Daily Loss ($)", GroupName = "Risk", Order = 1)]
+        public double MaxDailyLoss { get; set; } = 3400;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Base Contracts", GroupName = "Sizing", Order = 0)]
+        public int BaseContracts { get; set; } = 8;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Contracts", GroupName = "Sizing", Order = 1)]
+        public int MaxContracts { get; set; } = 70;
+
+        // Hard-coded peak drawdown from day HWM (you can parameterize later if you like)
+        private const double PeakDrawdownLimit = 3000.0;
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name = "M3_Ultra_v2";
+                Description = "Original Ultra M3 + 9:30-16:00 only + profit-lock breakeven";
+                Calculate = Calculate.OnEachTick;
+                EntriesPerDirection = 999;
+                EntryHandling = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy = true;
+                ExitOnSessionCloseSeconds = 30;
+                StopTargetHandling = StopTargetHandling.PerEntryExecution;
+                BarsRequiredToTrade = 50;
+                TraceOrders = true;
+                RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
+                ConnectionLossHandling = ConnectionLossHandling.KeepRunning;
+            }
+            else if (State == State.DataLoaded)
+            {
+                fastEMA = EMA(9);
+                slowEMA = EMA(21);
+                rsi     = RSI(14, 3);
+
+                AddChartIndicator(fastEMA);
+                AddChartIndicator(slowEMA);
+                AddChartIndicator(rsi);
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (CurrentBar < BarsRequiredToTrade)
+                return;
+
+            double equity = GetEquitySafe();
+
+            // ======================================================
+            // DAILY RESET
+            // ======================================================
+            if (currentDay == DateTime.MinValue || Time[0].Date != currentDay.Date)
+            {
+                currentDay = Time[0].Date;
+                dayStartEquity   = equity;
+                dayHighWatermark = equity;
+                profitLockedToday = false;
+
+                Print($"[Amelia ULTRA] DAY RESET {currentDay:yyyy-MM-dd}");
+                Print($"[Amelia ULTRA] Start Equity: {dayStartEquity:C}");
+            }
+
+            // ======================================================
+            // UPDATE HIGH WATERMARK & LOCK PROFIT
+            // ======================================================
+            if (equity > dayHighWatermark)
+            {
+                dayHighWatermark  = equity;
+                profitLockedToday = true;   // the day is now "locked green"
+                Print($"[PROFIT LOCK] New HWM {dayHighWatermark:C}");
+            }
+
+            // ======================================================
+            // KILL SWITCHES
+            // ======================================================
+            // 1) Straight daily loss from start of day
+            if (equity <= dayStartEquity - MaxDailyLoss)
+            {
+                Print($"[ULTRA] DAILY LOSS STOP | Equity: {equity:C} | Start: {dayStartEquity:C}");
+                SafeFlatten();
+                return;
+            }
+
+            // 2) Peak drawdown from high-watermark
+            if (equity <= dayHighWatermark - PeakDrawdownLimit)
+            {
+                Print($"[ULTRA] PEAK DD STOP | Equity: {equity:C} | HWM: {dayHighWatermark:C}");
+                SafeFlatten();
+                return;
+            }
+
+            // ======================================================
+            // 9:30 – 16:00 ONLY (ET)
+            // ======================================================
+            int t = ToTime(Time[0]);
+            if (t < 93000 || t >= 160000)
+                return;   // no new trades outside hours (session close flatten handles exits)
+
+            // ======================================================
+            // POSITION SIZING
+            // ======================================================
+            int qty = GetQuantity(equity);
+            if (qty <= 0)
+                return;
+
+            // ======================================================
+            // SIGNAL ENGINE (original Ultra with randomness)
+            // ======================================================
+            double mood = fastEMA[0] - slowEMA[0];
+
+            // Robust volume spike handling
+            double volSma = SMA(Volume, 20)[0];
+            if (volSma <= 0 || double.IsNaN(volSma))
+                return;
+
+            double volSpike = Volume[0] / volSma;
+            double random   = rand.NextDouble();
+
+            bool goLong  = mood > 0.05 && rsi[0] > 45 && volSpike > 1.2 && random > 0.50;
+            bool goShort = mood < -0.05 && rsi[0] < 55 && volSpike > 1.2 && random > 0.50;
+
+            // ======================================================
+            // ENTRIES
+            // ======================================================
+            if (Position.MarketPosition == MarketPosition.Flat)
+            {
+                if (goLong)
+                {
+                    // Initial hard stop and target
+                    SetStopLoss("Amelia", CalculationMode.Ticks, 22, false);
+                    SetProfitTarget("Amelia", CalculationMode.Ticks, 40);
+                    EnterLong(qty, "Amelia");
+                }
+                else if (goShort)
+                {
+                    SetStopLoss("Amelia", CalculationMode.Ticks, 22, false);
+                    SetProfitTarget("Amelia", CalculationMode.Ticks, 40);
+                    EnterShort(qty, "Amelia");
+                }
+            }
+
+            // ======================================================
+            // PARTIAL PROFIT + BREAKEVEN-TYPE TRAIL
+            // ======================================================
+            if (Position.MarketPosition == MarketPosition.Long)
+            {
+                // Take partial profits once +12 ticks in favor
+                if (Close[0] >= Position.AveragePrice + 12 * TickSize && Position.Quantity > 1)
+                {
+                    int partial = Math.Max(1, Position.Quantity / 2);
+                    ExitLong(partial, "Partial", "Amelia");
+
+                    // Move stop up toward breakeven + 4 ticks, but keep it BELOW market
+                    double targetStop = Position.AveragePrice + 4 * TickSize;
+                    double safeStop   = Math.Min(targetStop, Close[0] - 2 * TickSize);
+
+                    if (safeStop > Position.AveragePrice) // only ratchet if it's actually locking profit
+                    {
+                        SetStopLoss("Amelia", CalculationMode.Price, safeStop, false);
+                        Print($"[ULTRA] LONG TRAIL | Qty:{Position.Quantity} | New SL:{safeStop:F2}");
+                    }
+                }
+
+                // Day-level profit lock: tighten if we've locked profit for the day
+                if (profitLockedToday)
+                {
+                    double baseBe = Position.AveragePrice + 4 * TickSize;
+                    double safeBe = Math.Min(baseBe, Close[0] - 2 * TickSize);
+
+                    if (safeBe > Position.AveragePrice)
+                    {
+                        SetStopLoss("Amelia", CalculationMode.Price, safeBe, false);
+                    }
+                }
+            }
+            else if (Position.MarketPosition == MarketPosition.Short)
+            {
+                // Take partial profits once +12 ticks in favor
+                if (Close[0] <= Position.AveragePrice - 12 * TickSize && Position.Quantity > 1)
+                {
+                    int partial = Math.Max(1, Position.Quantity / 2);
+                    ExitShort(partial, "Partial", "Amelia");
+
+                    // Move stop down toward breakeven - 4 ticks, but keep it ABOVE market
+                    double targetStop = Position.AveragePrice - 4 * TickSize;
+                    double safeStop   = Math.Max(targetStop, Close[0] + 2 * TickSize);
+
+                    if (safeStop < Position.AveragePrice) // only ratchet if it's actually locking profit
+                    {
+                        SetStopLoss("Amelia", CalculationMode.Price, safeStop, false);
+                        Print($"[ULTRA] SHORT TRAIL | Qty:{Position.Quantity} | New SL:{safeStop:F2}");
+                    }
+                }
+
+                // Day-level profit lock: tighten if we've locked profit for the day
+                if (profitLockedToday)
+                {
+                    double baseBe = Position.AveragePrice - 4 * TickSize;
+                    double safeBe = Math.Max(baseBe, Close[0] + 2 * TickSize);
+
+                    if (safeBe < Position.AveragePrice)
+                    {
+                        SetStopLoss("Amelia", CalculationMode.Price, safeBe, false);
+                    }
+                }
+            }
+
+            // ======================================================
+            // DIAGNOSTICS (every 30 seconds)
+            // ======================================================
+            if ((DateTime.Now - lastDebugPrint).TotalSeconds > 30)
+            {
+                Print($"[ULTRA] Eq:{equity:C} HWM:{dayHighWatermark:C} Mood:{mood:F2} RSI:{rsi[0]:F1} VolSpike:{volSpike:F2} Qty:{qty} Pos:{Position.MarketPosition}");
+                lastDebugPrint = DateTime.Now;
+            }
+        }
+
+        // ==========================================================
+        // HELPER: SAFE EQUITY CALC
+        // ==========================================================
+        private double GetEquitySafe()
+        {
+            double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+            double unreal   = 0;
+
+            if (Position.MarketPosition != MarketPosition.Flat)
+                unreal = Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency);
+
+            return AccountSize + realized + unreal;
+        }
+
+        // ==========================================================
+        // HELPER: POSITION SIZING
+        //  • Starts at BaseContracts
+        //  • Scales up modestly with profit, capped at MaxContracts
+        // ==========================================================
+        private int GetQuantity(double equity)
+        {
+            double diff = equity - AccountSize;
+
+            if (diff <= 0)
+                return BaseContracts;
+
+            // +2 contracts per $2,000 above starting equity, capped
+            int steps = (int)(diff / 2000.0);
+            int qty   = BaseContracts + steps * 2;
+
+            if (qty > MaxContracts)
+                qty = MaxContracts;
+
+            if (qty < 1)
+                qty = 1;
+
+            return qty;
+        }
+
+        // ==========================================================
+        // HELPER: SAFE FLATTEN (no exceptions, no strategy disable)
+        // ==========================================================
+        private void SafeFlatten()
+        {
+            try
+            {
+                if (Position.MarketPosition == MarketPosition.Long)
+                    ExitLong("Flat", "Amelia");
+                else if (Position.MarketPosition == MarketPosition.Short)
+                    ExitShort("Flat", "Amelia");
+            }
+            catch (Exception ex)
+            {
+                Print($"[ULTRA] SafeFlatten exception: {ex.Message}");
+            }
+        }
+    }
+}
