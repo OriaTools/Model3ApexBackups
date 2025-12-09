@@ -1,0 +1,396 @@
+#region Using declarations
+using System;
+using System.ComponentModel.DataAnnotations;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Indicators;
+#endregion
+
+// ==================================================================
+// M3_Eval_Apex100K_Hybrid — M3 CORE + EMA SCALPS (APEX-SAFE)
+// • Core: original M3 eval engine (8 contracts, partial + BE trail)
+// • EMA scalps: small 2-contract add-on, only when flat and no M3 signal
+// • Shared risk: daily loss, trailing DD, profit cap, max trades/day
+// • 9:30–16:00 session, optional VIX brake, time stop, 1-minute chart
+// ==================================================================
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class M3_Eval_Apex100K_Hybrid : Strategy
+    {
+        private EMA fastEMA;
+        private EMA slowEMA;
+        private RSI rsi;
+        private double vixLast = 0;
+
+        // ——— USER PARAMETERS ———
+
+        [NinjaScriptProperty]
+        [Display(Name = "Use VIX Crash Brake", GroupName = "Crash Brake", Order = 0)]
+        public bool UseVixCrashBrake { get; set; } = false;
+
+        [NinjaScriptProperty]
+        [Display(Name = "VIX Panic Threshold", GroupName = "Crash Brake", Order = 1)]
+        public double VixPanicThreshold { get; set; } = 28.0;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Stop Ticks", GroupName = "Orders", Order = 0)]
+        public int StopTicks { get; set; } = 22;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Target Ticks", GroupName = "Orders", Order = 1)]
+        public int TargetTicks { get; set; } = 40;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Time Stop (sec)", GroupName = "Orders", Order = 2)]
+        public int TimeStopSeconds { get; set; } = 180;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Account Size ($)", GroupName = "Risk", Order = 0)]
+        public double AccountSize { get; set; } = 100000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Daily Loss ($)", GroupName = "Risk", Order = 1)]
+        public double MaxDailyLoss { get; set; } = 3000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Trailing DD ($)", GroupName = "Risk", Order = 2)]
+        public double MaxTrailingDrawdown { get; set; } = 2500;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Daily Profit ($)", GroupName = "Risk", Order = 3)]
+        public double MaxDailyProfit { get; set; } = 1200;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Trades Per Day", GroupName = "Risk", Order = 4)]
+        public int MaxTradesPerDay { get; set; } = 8;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Use Time Window", GroupName = "Session", Order = 0)]
+        public bool UseTimeWindow { get; set; } = true;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Session Start (HHmmss)", GroupName = "Session", Order = 1)]
+        public int SessionStart { get; set; } = 93000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Session End (HHmmss)", GroupName = "Session", Order = 2)]
+        public int SessionEnd { get; set; } = 160000;
+
+        // HYBRID TOGGLE + SIZE
+        [NinjaScriptProperty]
+        [Display(Name = "Use EMA Scalps", GroupName = "Hybrid", Order = 0)]
+        public bool UseEmaScalps { get; set; } = false;    // default OFF (pure M3 until you flip it on)
+
+        [NinjaScriptProperty]
+        [Display(Name = "EMA Scalp Contracts", GroupName = "Hybrid", Order = 1)]
+        public int EmaScalpContracts { get; set; } = 2;    // small add-on size
+
+        // ——— HARD-LOCKED CORE CONTRACTS ———
+        private const int CoreContracts = 8;
+
+        // ——— INTERNAL STATE ———
+        private DateTime currentDay = Core.Globals.MinDate;
+        private double dayStartEquity = 0;
+        private double dayHighWatermark = 0;
+        private int tradesToday = 0;
+        private DateTime lastEntryTime = Core.Globals.MinDate;
+
+        private bool dailyLossHit = false, trailingDDHit = false, dailyProfitHit = false, tradeLimitHit = false;
+        private bool printedDailyLoss = false, printedTrailingDD = false, printedDailyProfit = false, printedTradeLimit = false, printedVixBrake = false;
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name        = "M3_Eval_Apex100K_Hybrid";
+                Description = "M3 Apex 100K core + EMA scalp add-on (single, Apex-safe engine).";
+
+                Calculate               = Calculate.OnEachTick;
+                EntriesPerDirection     = 1;
+                EntryHandling           = EntryHandling.AllEntries;
+                BarsRequiredToTrade     = 50;
+                IsExitOnSessionCloseStrategy = false;    // we manually flatten at SessionEnd
+                TimeInForce             = TimeInForce.Day;
+                RealtimeErrorHandling   = RealtimeErrorHandling.IgnoreAllErrors;
+                ConnectionLossHandling  = ConnectionLossHandling.KeepRunning;
+                TraceOrders             = true;
+            }
+            else if (State == State.Configure)
+            {
+                // Only add VIX series if the brake is enabled (optional micro-optimization)
+                if (UseVixCrashBrake)
+                    AddDataSeries("^VIX", BarsPeriodType.Minute, 1, MarketDataType.Last);
+            }
+            else if (State == State.DataLoaded)
+            {
+                fastEMA = EMA(9);
+                slowEMA = EMA(21);
+                rsi     = RSI(14, 3);
+
+                AddChartIndicator(fastEMA);
+                AddChartIndicator(slowEMA);
+                AddChartIndicator(rsi);
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            // VIX series update
+            if (BarsInProgress == 1)
+            {
+                vixLast = Closes[1][0];
+                return;
+            }
+
+            if (BarsInProgress != 0 || CurrentBar < BarsRequiredToTrade)
+                return;
+
+            UpdateDailyState();
+
+            // Session control
+            if (UseTimeWindow)
+            {
+                int t = ToTime(Time[0]);
+                if (t < SessionStart)
+                    return;
+                if (t > SessionEnd)
+                {
+                    SafeFlatten();
+                    return;
+                }
+            }
+
+            // VIX crash brake
+            if (UseVixCrashBrake && vixLast > VixPanicThreshold)
+            {
+                if (!printedVixBrake)
+                {
+                    Print($"[HYBRID] VIX CRASH BRAKE — {vixLast:F2} (trading halted)");
+                    printedVixBrake = true;
+                }
+                SafeFlatten();
+                return;
+            }
+
+            if (IsTradingHaltedForToday())
+            {
+                SafeFlatten();
+                return;
+            }
+
+            // ============================
+            //  SIGNAL ENGINE: CORE + EMA
+            // ============================
+            double mood      = fastEMA[0] - slowEMA[0];
+            double volSma    = SMA(Volume, 20)[0];
+            double volSpike  = volSma.ApproxCompare(0) == 0 ? 1.0 : Volume[0] / volSma;
+
+            bool upTrend   = mood > 0;
+            bool downTrend = mood < 0;
+
+            // --- CORE M3 SIGNALS (unchanged from eval version) ---
+            bool goLongCore  = mood > 0.05  && rsi[0] > 45 && volSpike > 1.2;
+            bool goShortCore = mood < -0.05 && rsi[0] < 55 && volSpike > 1.2;
+
+            // --- EMA SCALP SIGNALS (small add-on, only if enabled) ---
+            bool goLongScalp  = false;
+            bool goShortScalp = false;
+
+            if (UseEmaScalps)
+            {
+                // Trend-follow pullback logic:
+                // Long scalps: uptrend, price above fast EMA, RSI 50–65, at least "normal" volume
+                goLongScalp =
+                    upTrend &&
+                    Close[0] > fastEMA[0] &&
+                    rsi[0] >= 50 && rsi[0] <= 65 &&
+                    volSpike > 0.8;
+
+                // Short scalps: downtrend, price below fast EMA, RSI 35–50, volume normal+
+                goShortScalp =
+                    downTrend &&
+                    Close[0] < fastEMA[0] &&
+                    rsi[0] <= 50 && rsi[0] >= 35 &&
+                    volSpike > 0.8;
+            }
+
+            bool canEnter = Position.MarketPosition == MarketPosition.Flat && tradesToday < MaxTradesPerDay;
+
+            // ——— ENTRY LOGIC ———
+            if (canEnter)
+            {
+                // Core M3 engine always has priority
+                if (goLongCore)
+                {
+                    SetStopLoss("Amelia", CalculationMode.Ticks, StopTicks, false);
+                    SetProfitTarget("Amelia", CalculationMode.Ticks, TargetTicks);
+                    EnterLong(CoreContracts, "Amelia");
+                }
+                else if (goShortCore)
+                {
+                    SetStopLoss("Amelia", CalculationMode.Ticks, StopTicks, false);
+                    SetProfitTarget("Amelia", CalculationMode.Ticks, TargetTicks);
+                    EnterShort(CoreContracts, "Amelia");
+                }
+                // If NO core signal, and scalps are enabled, allow EMA micro scalps
+                else if (UseEmaScalps)
+                {
+                    int scalpQty = Math.Max(1, EmaScalpContracts);
+
+                    if (goLongScalp)
+                    {
+                        SetStopLoss("Amelia", CalculationMode.Ticks, StopTicks, false);
+                        SetProfitTarget("Amelia", CalculationMode.Ticks, TargetTicks);
+                        EnterLong(scalpQty, "Amelia");
+                    }
+                    else if (goShortScalp)
+                    {
+                        SetStopLoss("Amelia", CalculationMode.Ticks, StopTicks, false);
+                        SetProfitTarget("Amelia", CalculationMode.Ticks, TargetTicks);
+                        EnterShort(scalpQty, "Amelia");
+                    }
+                }
+            }
+            // ——— IN-TRADE MANAGEMENT ———
+            else
+            {
+                // Time stop
+                if (lastEntryTime > Core.Globals.MinDate &&
+                    (Time[0] - lastEntryTime).TotalSeconds >= TimeStopSeconds)
+                {
+                    ExitLong("TimeStop", "Amelia");
+                    ExitShort("TimeStop", "Amelia");
+                }
+
+                // Shared partial + breakeven trail for BOTH core & scalp trades
+                if (Position.MarketPosition == MarketPosition.Long &&
+                    Close[0] >= Position.AveragePrice + 12 * TickSize)
+                {
+                    int partial = Math.Max(1, Position.Quantity / 2);
+                    ExitLong(partial, "Partial", "Amelia");
+                    SetStopLoss("Amelia", CalculationMode.Price,
+                        Position.AveragePrice + 4 * TickSize, false);
+                }
+                else if (Position.MarketPosition == MarketPosition.Short &&
+                         Close[0] <= Position.AveragePrice - 12 * TickSize)
+                {
+                    int partial = Math.Max(1, Position.Quantity / 2);
+                    ExitShort(partial, "Partial", "Amelia");
+                    SetStopLoss("Amelia", CalculationMode.Price,
+                        Position.AveragePrice - 4 * TickSize, false);
+                }
+            }
+        }
+
+        // ============================
+        //  EXECUTION / RISK TRACKING
+        // ============================
+
+        protected override void OnExecutionUpdate(Execution execution, string executionId, double price,
+                                                  int quantity, MarketPosition marketPosition, string orderId, DateTime time)
+        {
+            if (execution?.Order == null || execution.Order.OrderState != OrderState.Filled)
+                return;
+
+            // Count BOTH core & scalp entries (same signal name "Amelia")
+            if (execution.Order.Name == "Amelia" &&
+                (execution.Order.OrderAction == OrderAction.Buy ||
+                 execution.Order.OrderAction == OrderAction.SellShort))
+            {
+                tradesToday++;
+                lastEntryTime = time;
+                Print($"[HYBRID] Trade #{tradesToday} | {execution.Order.OrderAction} {execution.Order.Quantity} @ {price}");
+            }
+
+            if (Position.MarketPosition == MarketPosition.Flat)
+                lastEntryTime = Core.Globals.MinDate;
+        }
+
+        private void UpdateDailyState()
+        {
+            if (currentDay != Times[0][0].Date)
+            {
+                currentDay = Times[0][0].Date;
+                double eq = GetEquitySafe();
+                dayStartEquity = dayHighWatermark = eq;
+                tradesToday = 0;
+
+                dailyLossHit = trailingDDHit = dailyProfitHit = tradeLimitHit = false;
+                printedDailyLoss = printedTrailingDD = printedDailyProfit = printedTradeLimit = printedVixBrake = false;
+
+                Print($"[HYBRID] DAY RESET {currentDay:yyyy-MM-dd} | Equity = {eq:C}");
+            }
+
+            double eqNow = GetEquitySafe();
+            if (eqNow > dayHighWatermark)
+                dayHighWatermark = eqNow;
+        }
+
+        private bool IsTradingHaltedForToday()
+        {
+            double eq      = GetEquitySafe();
+            double dayPnL  = eq - dayStartEquity;
+            double trailDD = eq - dayHighWatermark;
+
+            if (!trailingDDHit && trailDD <= -MaxTrailingDrawdown)
+            {
+                trailingDDHit = true;
+                if (!printedTrailingDD)
+                {
+                    Print($"[GUARD] Trailing DD breach {trailDD:C} (limit {MaxTrailingDrawdown:C}) — trading halted.");
+                    printedTrailingDD = true;
+                }
+            }
+
+            if (!dailyLossHit && dayPnL <= -MaxDailyLoss)
+            {
+                dailyLossHit = true;
+                if (!printedDailyLoss)
+                {
+                    Print($"[GUARD] Daily loss breach {dayPnL:C} (limit {MaxDailyLoss:C}) — trading halted.");
+                    printedDailyLoss = true;
+                }
+            }
+
+            if (!dailyProfitHit && dayPnL >= MaxDailyProfit)
+            {
+                dailyProfitHit = true;
+                if (!printedDailyProfit)
+                {
+                    Print($"[GUARD] Profit cap reached {dayPnL:C} (cap {MaxDailyProfit:C}) — trading halted.");
+                    printedDailyProfit = true;
+                }
+            }
+
+            if (!tradeLimitHit && tradesToday >= MaxTradesPerDay)
+            {
+                tradeLimitHit = true;
+                if (!printedTradeLimit)
+                {
+                    Print($"[GUARD] Max trades hit ({tradesToday}) — trading halted.");
+                    printedTradeLimit = true;
+                }
+            }
+
+            return trailingDDHit || dailyLossHit || dailyProfitHit || tradeLimitHit;
+        }
+
+        private double GetEquitySafe()
+        {
+            double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+            double unreal   = Position.MarketPosition != MarketPosition.Flat
+                ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
+                : 0;
+
+            return AccountSize + realized + unreal;
+        }
+
+        private void SafeFlatten()
+        {
+            try { ExitLong("Flat", "Amelia"); }  catch { }
+            try { ExitShort("Flat", "Amelia"); } catch { }
+        }
+    }
+}
