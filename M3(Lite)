@@ -1,0 +1,543 @@
+#region Using declarations
+using System;
+using System.ComponentModel.DataAnnotations;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Indicators;
+#endregion
+
+// ==================================================================
+//  M3_ApexLite — Original M3 Engine + Apex Eval Guard Rails
+//
+//  • Original M3 logic (EMA9 / EMA21 + RSI + volume spike)
+//  • NO randomness (no Random.NextDouble)
+//  • Base contracts  = 8, scales up with profit (same M3 sizing feel)
+//  • Partial at +12 ticks, trail stop toward BE + 4 ticks
+//  • Daily soft loss cap     :   -$900 (MaxDailyLoss)
+//  • Daily soft profit cap   :   +$900 (MaxDailyProfit)
+//  • Trailing DD guard from HWM: -$3,000 (MaxTrailingDrawdown)
+//  • Max 6 trades per day (MaxTradesPerDay)
+//  • 2-minute cooldown between entries (EntryCooldownSeconds)
+//  • Two Apex-safe time windows (default ET):
+//      - 09:32:00 → 11:30:00
+//      - 13:40:00 → 15:55:00
+//  • DisableNonTradingDays toggle:
+//      - true  = no weekends + no holidays from HolidayListCsv
+//      - false = ignore weekends/holidays (for non-Apex use)
+//
+//  Attach to MNQ 1m or 2m chart, SIM or Apex 100K eval account.
+// ==================================================================
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class M3_ApexLite : Strategy
+    {
+        // ------------- Indicators -------------
+        private EMA fastEMA;
+        private EMA slowEMA;
+        private RSI rsi;
+
+        // ------------- Day / equity tracking -------------
+        private DateTime currentDay       = DateTime.MinValue;
+        private double   dayStartEquity   = 0;
+        private double   dayHighWatermark = 0;
+
+        private bool     profitLockedToday = false;
+
+        // ------------- Trade / guard tracking -------------
+        private int      tradesToday      = 0;
+        private DateTime lastEntryTime    = DateTime.MinValue;
+        private DateTime lastDebugPrint   = DateTime.MinValue;
+
+        private bool trailingDDHit        = false;
+        private bool dailyLossHit         = false;
+        private bool dailyProfitHit       = false;
+        private bool tradeLimitHit        = false;
+
+        private bool printedTrailingDD    = false;
+        private bool printedDailyLoss     = false;
+        private bool printedDailyProfit   = false;
+        private bool printedTradeLimit    = false;
+
+        // ==================================================
+        //  PARAMETERS
+        // ==================================================
+
+        // ---- Risk / sizing ----
+        [NinjaScriptProperty]
+        [Display(Name = "Account Size ($)", GroupName = "Risk", Order = 0)]
+        public double AccountSize { get; set; } = 100000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Base Contracts", GroupName = "Risk", Order = 1)]
+        public int BaseContracts { get; set; } = 8;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Contracts", GroupName = "Risk", Order = 2)]
+        public int MaxContracts { get; set; } = 70;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Daily Loss ($)", GroupName = "Risk", Order = 3)]
+        public double MaxDailyLoss { get; set; } = 900;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Daily Profit ($)", GroupName = "Risk", Order = 4)]
+        public double MaxDailyProfit { get; set; } = 900;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Trailing DD ($)", GroupName = "Risk", Order = 5)]
+        public double MaxTrailingDrawdown { get; set; } = 3000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Trades Per Day", GroupName = "Risk", Order = 6)]
+        public int MaxTradesPerDay { get; set; } = 6;
+
+        // ---- Orders / stops ----
+        [NinjaScriptProperty]
+        [Display(Name = "Time Stop (sec)", GroupName = "Orders", Order = 0)]
+        public int TimeStopSeconds { get; set; } = 180;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Stop Ticks", GroupName = "Orders", Order = 1)]
+        public int StopTicks { get; set; } = 22;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Target Ticks", GroupName = "Orders", Order = 2)]
+        public int TargetTicks { get; set; } = 40;
+
+        // ---- Session windows ----
+        [NinjaScriptProperty]
+        [Display(Name = "Session1 Start (HHmmss)", GroupName = "Session", Order = 0)]
+        public int Session1Start { get; set; } = 93200;   // 09:32:00
+
+        [NinjaScriptProperty]
+        [Display(Name = "Session1 End (HHmmss)", GroupName = "Session", Order = 1)]
+        public int Session1End { get; set; } = 113000;    // 11:30:00
+
+        [NinjaScriptProperty]
+        [Display(Name = "Session2 Start (HHmmss)", GroupName = "Session", Order = 2)]
+        public int Session2Start { get; set; } = 134000;  // 13:40:00
+
+        [NinjaScriptProperty]
+        [Display(Name = "Session2 End (HHmmss)", GroupName = "Session", Order = 3)]
+        public int Session2End { get; set; } = 155500;    // 15:55:00
+
+        // ---- Non-trading day guard ----
+        [NinjaScriptProperty]
+        [Display(Name = "Disable Non-Trading Days", GroupName = "Session", Order = 9)]
+        public bool DisableNonTradingDays { get; set; } = true;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Holiday List (yyyyMMdd, comma-separated)", GroupName = "Session", Order = 10)]
+        public string HolidayListCsv { get; set; } = "20251225,20260101"; 
+        // 2025-12-25 (Christmas), 2026-01-01 (New Year’s Day)
+
+        // ---- Internal constants ----
+        private const int EntryCooldownSeconds = 120;   // 2 minutes between entries
+
+        // ==================================================
+        //  STATE
+        // ==================================================
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name        = "M3_ApexLite";
+                Description = "Original M3 logic + Apex eval guard rails (no randomness).";
+
+                Calculate                   = Calculate.OnEachTick;
+                EntriesPerDirection         = 999;
+                EntryHandling               = EntryHandling.AllEntries;
+                IsExitOnSessionCloseStrategy = false;   // we manage flattening via windows/guards
+                ExitOnSessionCloseSeconds    = 0;
+
+                StopTargetHandling          = StopTargetHandling.PerEntryExecution;
+                BarsRequiredToTrade         = 50;
+
+                RealtimeErrorHandling       = RealtimeErrorHandling.IgnoreAllErrors;
+                ConnectionLossHandling      = ConnectionLossHandling.KeepRunning;
+                TraceOrders                 = true;
+            }
+            else if (State == State.DataLoaded)
+            {
+                fastEMA = EMA(9);
+                slowEMA = EMA(21);
+                rsi     = RSI(14, 3);
+
+                AddChartIndicator(fastEMA);
+                AddChartIndicator(slowEMA);
+                AddChartIndicator(rsi);
+            }
+        }
+
+        // ==================================================
+        //  MAIN LOOP
+        // ==================================================
+        protected override void OnBarUpdate()
+        {
+            if (CurrentBar < BarsRequiredToTrade || BarsInProgress != 0)
+                return;
+
+            // ---------------------------------------------
+            // Non-trading day guard (weekends + holidays)
+            // ---------------------------------------------
+            if (DisableNonTradingDays)
+            {
+                if (Time[0].DayOfWeek == DayOfWeek.Saturday || Time[0].DayOfWeek == DayOfWeek.Sunday || IsHoliday(Time[0]))
+                {
+                    SafeFlatten();
+                    return;
+                }
+            }
+
+            double equity = GetEquitySafe();
+            UpdateDailyState(equity);
+
+            if (IsTradingHaltedForToday(equity))
+            {
+                SafeFlatten();
+                return;
+            }
+
+            // ---------------------------------------------
+            // Time window control (two Apex-safe windows)
+            // ---------------------------------------------
+            int t = ToTime(Time[0]);
+            bool inSession1 = t >= Session1Start && t <= Session1End;
+            bool inSession2 = t >= Session2Start && t <= Session2End;
+            bool inWindow   = inSession1 || inSession2;
+
+            if (!inWindow)
+            {
+                // No new trades; if in a trade, exit politely.
+                if (Position.MarketPosition != MarketPosition.Flat)
+                    SafeFlatten();
+                return;
+            }
+
+            // ---------------------------------------------
+            // Time stop for open trades
+            // ---------------------------------------------
+            if (Position.MarketPosition != MarketPosition.Flat &&
+                lastEntryTime != DateTime.MinValue)
+            {
+                if ((Time[0] - lastEntryTime).TotalSeconds >= TimeStopSeconds)
+                {
+                    Print($"[M3_ApexLite] TIME STOP hit at {Time[0]}");
+                    SafeFlatten();
+                    return;
+                }
+            }
+
+            // ---------------------------------------------
+            // M3 core signal engine (no randomness)
+            // ---------------------------------------------
+            double mood   = fastEMA[0] - slowEMA[0];
+            double volSma = SMA(Volume, 20)[0];
+            if (volSma <= 0 || double.IsNaN(volSma))
+                return;
+
+            double volSpike = Volume[0] / volSma;
+
+            bool goLong  = mood > 0.05  && rsi[0] > 45 && volSpike > 1.2;
+            bool goShort = mood < -0.05 && rsi[0] < 55 && volSpike > 1.2;
+
+            // ---------------------------------------------
+            // Partial + BE-style trail
+            // ---------------------------------------------
+            if (Position.MarketPosition == MarketPosition.Long)
+            {
+                // Partial at +12 ticks
+                if (Close[0] >= Position.AveragePrice + 12 * TickSize && Position.Quantity > 1)
+                {
+                    int partial = Math.Max(1, Position.Quantity / 2);
+                    ExitLong(partial, "Partial", "Amelia");
+
+                    // Trail stop toward BE + 4 ticks, but keep under market
+                    double targetStop = Position.AveragePrice + 4 * TickSize;
+                    double safeStop   = Math.Min(targetStop, Close[0] - 2 * TickSize);
+
+                    if (safeStop > Position.AveragePrice)
+                    {
+                        SetStopLoss("Amelia", CalculationMode.Price, safeStop, false);
+                        Print($"[M3_ApexLite] LONG trail: Qty={Position.Quantity}, SL={safeStop:F2}");
+                    }
+                }
+
+                // If we’ve locked profit for the day, tighten even more
+                if (profitLockedToday)
+                {
+                    double baseBe = Position.AveragePrice + 4 * TickSize;
+                    double safeBe = Math.Min(baseBe, Close[0] - 2 * TickSize);
+
+                    if (safeBe > Position.AveragePrice)
+                        SetStopLoss("Amelia", CalculationMode.Price, safeBe, false);
+                }
+            }
+            else if (Position.MarketPosition == MarketPosition.Short)
+            {
+                if (Close[0] <= Position.AveragePrice - 12 * TickSize && Position.Quantity > 1)
+                {
+                    int partial = Math.Max(1, Position.Quantity / 2);
+                    ExitShort(partial, "Partial", "Amelia");
+
+                    // Trail stop toward BE - 4 ticks, but keep above market
+                    double targetStop = Position.AveragePrice - 4 * TickSize;
+                    double safeStop   = Math.Max(targetStop, Close[0] + 2 * TickSize);
+
+                    if (safeStop < Position.AveragePrice)
+                    {
+                        SetStopLoss("Amelia", CalculationMode.Price, safeStop, false);
+                        Print($"[M3_ApexLite] SHORT trail: Qty={Position.Quantity}, SL={safeStop:F2}");
+                    }
+                }
+
+                if (profitLockedToday)
+                {
+                    double baseBe = Position.AveragePrice - 4 * TickSize;
+                    double safeBe = Math.Max(baseBe, Close[0] + 2 * TickSize);
+
+                    if (safeBe < Position.AveragePrice)
+                        SetStopLoss("Amelia", CalculationMode.Price, safeBe, false);
+                }
+            }
+
+            // ---------------------------------------------
+            // Entry conditions / cooldown
+            // ---------------------------------------------
+            if (Position.MarketPosition != MarketPosition.Flat)
+                return;
+
+            // Daily trade cap
+            if (tradesToday >= MaxTradesPerDay)
+                return;
+
+            // Cooldown guard (2 minutes after last entry)
+            if (lastEntryTime != DateTime.MinValue &&
+                (Time[0] - lastEntryTime).TotalSeconds < EntryCooldownSeconds)
+                return;
+
+            int qty = GetQuantity(equity);
+            if (qty <= 0)
+                return;
+
+            if (goLong)
+            {
+                SetStopLoss("Amelia", CalculationMode.Ticks, StopTicks, false);
+                SetProfitTarget("Amelia", CalculationMode.Ticks, TargetTicks);
+                EnterLong(qty, "Amelia");
+            }
+            else if (goShort)
+            {
+                SetStopLoss("Amelia", CalculationMode.Ticks, StopTicks, false);
+                SetProfitTarget("Amelia", CalculationMode.Ticks, TargetTicks);
+                EnterShort(qty, "Amelia");
+            }
+
+            // ---------------------------------------------
+            // Diagnostics every ~30 seconds
+            // ---------------------------------------------
+            if ((DateTime.Now - lastDebugPrint).TotalSeconds > 30)
+            {
+                double dayPnL  = equity - dayStartEquity;
+                double trailDD = equity - dayHighWatermark;
+                Print($"[M3_ApexLite] Eq:{equity:C0} DayPnL:{dayPnL:C0} HWM:{dayHighWatermark:C0} DD:{trailDD:C0} Mood:{mood:F3} RSI:{rsi[0]:F1} VolSpike:{volSpike:F2} Trades:{tradesToday} Pos:{Position.MarketPosition}");
+                lastDebugPrint = DateTime.Now;
+            }
+        }
+
+        // ==================================================
+        //  EXECUTION TRACKING
+        // ==================================================
+        protected override void OnExecutionUpdate(Execution execution, string executionId, double price,
+                                                  int quantity, MarketPosition marketPosition, string orderId, DateTime time)
+        {
+            try
+            {
+                if (execution == null || execution.Order == null)
+                    return;
+
+                if (execution.Order.OrderState != OrderState.Filled)
+                    return;
+
+                // Count NEW entries only (name "Amelia", Buy or SellShort)
+                if (execution.Order.Name == "Amelia" &&
+                    (execution.Order.OrderAction == OrderAction.Buy ||
+                     execution.Order.OrderAction == OrderAction.SellShort))
+                {
+                    tradesToday++;
+                    lastEntryTime = time;
+                    Print($"[M3_ApexLite] Trade #{tradesToday} | {execution.Order.OrderAction} {execution.Order.Quantity} @ {price} | {time}");
+                }
+
+                // When flat, reset entry time so cooldown anchors to last real entry
+                if (Position.MarketPosition == MarketPosition.Flat)
+                    lastEntryTime = DateTime.MinValue;
+            }
+            catch (Exception ex)
+            {
+                Print($"[M3_ApexLite] OnExecutionUpdate exception: {ex.Message}");
+            }
+        }
+
+        // ==================================================
+        //  DAILY STATE
+        // ==================================================
+        private void UpdateDailyState(double equity)
+        {
+            if (currentDay == DateTime.MinValue || Time[0].Date != currentDay.Date)
+            {
+                currentDay        = Time[0].Date;
+                dayStartEquity    = equity;
+                dayHighWatermark  = equity;
+                profitLockedToday = false;
+
+                tradesToday        = 0;
+                trailingDDHit      = false;
+                dailyLossHit       = false;
+                dailyProfitHit     = false;
+                tradeLimitHit      = false;
+
+                printedTrailingDD  = false;
+                printedDailyLoss   = false;
+                printedDailyProfit = false;
+                printedTradeLimit  = false;
+
+                Print($"[M3_ApexLite] NEW DAY {currentDay:yyyy-MM-dd} | Start Eq: {equity:C0}");
+            }
+
+            if (equity > dayHighWatermark)
+            {
+                dayHighWatermark  = equity;
+                profitLockedToday = true;
+                Print($"[M3_ApexLite] New HWM: {dayHighWatermark:C0} (profit locked)");
+            }
+        }
+
+        private bool IsTradingHaltedForToday(double equity)
+        {
+            double dayPnL  = equity - dayStartEquity;
+            double trailDD = equity - dayHighWatermark;
+
+            if (!trailingDDHit && trailDD <= -MaxTrailingDrawdown)
+            {
+                trailingDDHit = true;
+                if (!printedTrailingDD)
+                {
+                    Print($"[GUARD] Trailing DD breach {trailDD:C0} (limit -{MaxTrailingDrawdown:C0}). Trading halted.");
+                    printedTrailingDD = true;
+                }
+            }
+
+            if (!dailyLossHit && dayPnL <= -MaxDailyLoss)
+            {
+                dailyLossHit = true;
+                if (!printedDailyLoss)
+                {
+                    Print($"[GUARD] Daily loss breach {dayPnL:C0} (limit -{MaxDailyLoss:C0}). Trading halted.");
+                    printedDailyLoss = true;
+                }
+            }
+
+            if (!dailyProfitHit && dayPnL >= MaxDailyProfit)
+            {
+                dailyProfitHit = true;
+                if (!printedDailyProfit)
+                {
+                    Print($"[GUARD] Profit cap reached {dayPnL:C0} (cap {MaxDailyProfit:C0}). Trading halted.");
+                    printedDailyProfit = true;
+                }
+            }
+
+            if (!tradeLimitHit && tradesToday >= MaxTradesPerDay)
+            {
+                tradeLimitHit = true;
+                if (!printedTradeLimit)
+                {
+                    Print($"[GUARD] Max trades hit ({tradesToday}). Trading halted.");
+                    printedTradeLimit = true;
+                }
+            }
+
+            return trailingDDHit || dailyLossHit || dailyProfitHit || tradeLimitHit;
+        }
+
+        // ==================================================
+        //  HELPERS
+        // ==================================================
+        private double GetEquitySafe()
+        {
+            double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+            double unreal   = Position.MarketPosition != MarketPosition.Flat
+                ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
+                : 0;
+
+            return AccountSize + realized + unreal;
+        }
+
+        private int GetQuantity(double equity)
+        {
+            double diff = equity - AccountSize;
+
+            if (diff <= 0)
+                return BaseContracts;
+
+            // +2 contracts per +$2,000, capped at MaxContracts
+            int steps = (int)(diff / 2000.0);
+            int qty   = BaseContracts + steps * 2;
+
+            if (qty > MaxContracts)
+                qty = MaxContracts;
+            if (qty < 1)
+                qty = 1;
+
+            return qty;
+        }
+
+        private bool IsHoliday(DateTime dt)
+        {
+            try
+            {
+                string csv = (HolidayListCsv ?? string.Empty).Trim();
+                if (string.IsNullOrEmpty(csv))
+                    return false;
+
+                int todayInt = dt.Year * 10000 + dt.Month * 100 + dt.Day;
+
+                string[] parts = csv.Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (string raw in parts)
+                {
+                    string s = raw.Trim();
+                    if (s.Length == 0)
+                        continue;
+
+                    int val;
+                    if (int.TryParse(s, out val) && val == todayInt)
+                        return true;
+                }
+            }
+            catch
+            {
+                // If anything goes wrong, fail open (do not treat as holiday)
+            }
+
+            return false;
+        }
+
+        private void SafeFlatten()
+        {
+            try
+            {
+                if (Position.MarketPosition == MarketPosition.Long)
+                    ExitLong("Flat", "Amelia");
+                else if (Position.MarketPosition == MarketPosition.Short)
+                    ExitShort("Flat", "Amelia");
+            }
+            catch (Exception ex)
+            {
+                Print($"[M3_ApexLite] SafeFlatten exception: {ex.Message}");
+            }
+        }
+    }
+}
