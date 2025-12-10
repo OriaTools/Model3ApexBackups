@@ -1,0 +1,296 @@
+#region Using declarations
+using System;
+using System.ComponentModel.DataAnnotations;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Indicators;
+#endregion
+
+// ==================================================================
+//  M3_24_7 — 24/7 SIM TEST VERSION (MATCHES M3_EVAL LOGIC)
+//
+//  ✔ 8 contracts hard-locked (Apex-safe sizing)
+//  ✔ Partial at +12 ticks, breakeven +4 ticks
+//  ✔ Profit-lock tightening (+6 ticks after partial)
+//  ✔ Trailing DD guard: –$2,500 from day HWM
+//  ✔ Daily profit cap +$1,200
+//  ✔ Max 8 trades/day
+//  ✔ Optional time window (default OFF → 24/7)
+//  ✔ Auto-flatten when outside window if enabled
+//  ✔ No randomness, no scaling, no cooldown
+//
+//  Attach on MNQ 1-minute ETH chart (CME US Index Futures ETH).
+// ==================================================================
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class M3_24_7 : Strategy
+    {
+        private EMA fastEMA;
+        private EMA slowEMA;
+        private RSI rsi;
+
+        private const int Contracts = 8;
+
+        private DateTime currentDay       = DateTime.MinValue;
+        private double   dayStartEquity   = 0;
+        private double   dayHighWatermark = 0;
+        private int      tradesToday      = 0;
+        private DateTime lastEntryTime    = DateTime.MinValue;
+
+        private bool trailingDDHit        = false;
+        private bool dailyProfitHit       = false;
+        private bool tradeLimitHit        = false;
+        private bool profitLockedToday    = false;
+
+        // ——— USER PARAMETERS ———
+        [NinjaScriptProperty]
+        public bool UseTimeWindow { get; set; } = false;   // false = full ETH 24/7 style
+
+        [NinjaScriptProperty]
+        public int SessionStart { get; set; } = 93000;     // used only if UseTimeWindow = true
+
+        [NinjaScriptProperty]
+        public int SessionEnd   { get; set; } = 160000;
+
+        [NinjaScriptProperty]
+        public double MaxTrailingDrawdown { get; set; } = 2500;
+
+        [NinjaScriptProperty]
+        public double MaxDailyProfitCap   { get; set; } = 1200;
+
+        [NinjaScriptProperty]
+        public int    MaxTradesPerDay     { get; set; } = 8;
+
+        // ==============================================================
+        //  STATE
+        // ==============================================================
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name        = "M3_24_7";
+                Description = "M3 engine for 24/7 SIM testing — same logic as M3_Eval.";
+
+                Calculate               = Calculate.OnEachTick;
+                EntriesPerDirection     = 1;
+                EntryHandling           = EntryHandling.AllEntries;
+                BarsRequiredToTrade     = 50;
+
+                IsExitOnSessionCloseStrategy = true;
+                ExitOnSessionCloseSeconds    = 30;
+
+                RealtimeErrorHandling   = RealtimeErrorHandling.IgnoreAllErrors;
+                ConnectionLossHandling  = ConnectionLossHandling.KeepRunning;
+                TraceOrders             = true;
+            }
+            else if (State == State.DataLoaded)
+            {
+                fastEMA = EMA(9);
+                slowEMA = EMA(21);
+                rsi     = RSI(14, 3);
+
+                AddChartIndicator(fastEMA);
+                AddChartIndicator(slowEMA);
+                AddChartIndicator(rsi);
+            }
+        }
+
+        // ==============================================================
+        //  MAIN LOOP
+        // ==============================================================
+
+        protected override void OnBarUpdate()
+        {
+            if (CurrentBar < BarsRequiredToTrade)
+                return;
+
+            double equity = GetEquitySafe();
+            UpdateDailyState(equity);
+
+            // ——— Optional time window control ———
+            if (UseTimeWindow)
+            {
+                int t = ToTime(Time[0]);
+                if (t < SessionStart || t > SessionEnd)
+                {
+                    SafeFlatten();
+                    return;
+                }
+            }
+
+            // ——— Risk guards ———
+            if (IsTradingHalted(equity))
+            {
+                SafeFlatten();
+                return;
+            }
+
+            // ——— Signal Engine ———
+            double volSma = SMA(Volume, 20)[0];
+            if (volSma <= 0 || double.IsNaN(volSma))
+                return;
+
+            double mood     = fastEMA[0] - slowEMA[0];
+            double volSpike = Volume[0] / volSma;
+
+            bool goLong  = mood > 0.05 && rsi[0] > 45 && volSpike > 1.2;
+            bool goShort = mood < -0.05 && rsi[0] < 55 && volSpike > 1.2;
+
+            // ——— ENTRY ———
+            if (Position.MarketPosition == MarketPosition.Flat &&
+                tradesToday < MaxTradesPerDay)
+            {
+                if (goLong)
+                {
+                    SetStopLoss("M3_24_7", CalculationMode.Ticks, 22, false);
+                    SetProfitTarget("M3_24_7", CalculationMode.Ticks, 40);
+                    EnterLong(Contracts, "M3_24_7");
+                }
+                else if (goShort)
+                {
+                    SetStopLoss("M3_24_7", CalculationMode.Ticks, 22, false);
+                    SetProfitTarget("M3_24_7", CalculationMode.Ticks, 40);
+                    EnterShort(Contracts, "M3_24_7");
+                }
+            }
+            // ——— IN-TRADE MANAGEMENT ———
+            else if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                // Time stop
+                if (lastEntryTime > DateTime.MinValue &&
+                    (Time[0] - lastEntryTime).TotalSeconds > 180)
+                    SafeFlatten();
+
+                // Long partial + trail
+                if (Position.MarketPosition == MarketPosition.Long &&
+                    Close[0] >= Position.AveragePrice + 12 * TickSize)
+                {
+                    int partial = Math.Max(1, Position.Quantity / 2);
+                    ExitLong(partial, "Partial", "M3_24_7");
+
+                    double baseSL = Position.AveragePrice + 4 * TickSize;
+                    SetStopLoss("M3_24_7", CalculationMode.Price, baseSL, false);
+
+                    if (profitLockedToday)
+                    {
+                        double tighter = Position.AveragePrice + 6 * TickSize;
+                        double safe    = Math.Min(tighter, Close[0] - 2 * TickSize);
+                        SetStopLoss("M3_24_7", CalculationMode.Price, safe, false);
+                    }
+                }
+
+                // Short partial + trail
+                if (Position.MarketPosition == MarketPosition.Short &&
+                    Close[0] <= Position.AveragePrice - 12 * TickSize)
+                {
+                    int partial = Math.Max(1, Position.Quantity / 2);
+                    ExitShort(partial, "Partial", "M3_24_7");
+
+                    double baseSL = Position.AveragePrice - 4 * TickSize;
+                    SetStopLoss("M3_24_7", CalculationMode.Price, baseSL, false);
+
+                    if (profitLockedToday)
+                    {
+                        double tighter = Position.AveragePrice - 6 * TickSize;
+                        double safe    = Math.Max(tighter, Close[0] + 2 * TickSize);
+                        SetStopLoss("M3_24_7", CalculationMode.Price, safe, false);
+                    }
+                }
+            }
+        }
+
+        // ==============================================================
+        //  EXECUTION TRACKING
+        // ==============================================================
+
+        protected override void OnExecutionUpdate(Execution exec, string id, double price,
+                                                  int qty, MarketPosition mp, string orderId, DateTime time)
+        {
+            if (exec?.Order == null || exec.Order.Name != "M3_24_7")
+                return;
+
+            if (exec.Order.OrderAction == OrderAction.Buy ||
+                exec.Order.OrderAction == OrderAction.SellShort)
+            {
+                tradesToday++;
+                lastEntryTime = time;
+            }
+
+            if (Position.MarketPosition == MarketPosition.Flat)
+                lastEntryTime = DateTime.MinValue;
+        }
+
+        // ==============================================================
+        //  DAILY STATE  (WITH CORRECT PROFIT-LOCK)
+        // ==============================================================
+
+        private void UpdateDailyState(double equity)
+        {
+            if (currentDay != Time[0].Date)
+            {
+                currentDay        = Time[0].Date;
+                dayStartEquity    = equity;
+                dayHighWatermark  = equity;
+                tradesToday       = 0;
+
+                trailingDDHit     = false;
+                dailyProfitHit    = false;
+                tradeLimitHit     = false;
+                profitLockedToday = false;   // reset each new day
+            }
+
+            // PROFIT LOCK ACTIVATES FIRST
+            if (equity > dayHighWatermark + 50)
+                profitLockedToday = true;
+
+            // Then update high water mark
+            if (equity > dayHighWatermark)
+                dayHighWatermark = equity;
+        }
+
+        // ==============================================================
+        //  GUARDS
+        // ==============================================================
+
+        private bool IsTradingHalted(double equity)
+        {
+            double dayPnL  = equity - dayStartEquity;
+            double trailDD = equity - dayHighWatermark;
+
+            if (trailDD <= -MaxTrailingDrawdown)
+                trailingDDHit = true;
+
+            if (dayPnL >= MaxDailyProfitCap)
+                dailyProfitHit = true;
+
+            if (tradesToday >= MaxTradesPerDay)
+                tradeLimitHit = true;
+
+            return trailingDDHit || dailyProfitHit || tradeLimitHit;
+        }
+
+        // ==============================================================
+        //  HELPERS
+        // ==============================================================
+
+        private double GetEquitySafe()
+        {
+            double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+            double unreal   = Position.MarketPosition != MarketPosition.Flat
+                ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
+                : 0;
+
+            return 100000 + realized + unreal;
+        }
+
+        private void SafeFlatten()
+        {
+            try { ExitLong("Flat", "M3_24_7"); } catch { }
+            try { ExitShort("Flat", "M3_24_7"); } catch { }
+        }
+    }
+}
+
