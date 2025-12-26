@@ -1,0 +1,259 @@
+#region Using declarations
+using System;
+using System.ComponentModel.DataAnnotations;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Indicators;
+using NinjaTrader.Core;
+#endregion
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class ApexM3_Elite_Final : Strategy
+    {
+        // ───────── Indicators ─────────
+        private EMA fastEMA;
+        private EMA slowEMA;
+        private RSI rsi;
+        private ADX adx;
+
+        // ───────── ATM State ─────────
+        private string activeAtmId = string.Empty;
+        private bool atmPending = false;
+
+        // ───────── Timing & Guards ─────────
+        private DateTime realtimeStart = DateTime.MinValue;
+        private DateTime lastSubmitTime = DateTime.MinValue;
+        private int lastEntryBar = -1;
+
+        private const int WarmUpSeconds = 8;
+        private const int AntiBurstSeconds = 60;
+
+        // ───────── Daily State ─────────
+        private DateTime currentDay = DateTime.MinValue;
+        private double dayStartEquity = 0;
+        private double dayHighWatermark = 0;
+        private int tradesToday = 0;
+        private bool forcedFlatToday = false;
+        private bool realtimeInitialized = false;
+
+        // ───────── Parameters ─────────
+        [NinjaScriptProperty]
+        [Display(Name = "Eval Starting Balance ($)", GroupName = "Risk", Order = 0)]
+        public double EvalStartingBalance { get; set; } = 100000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Trades Per Day", GroupName = "Risk", Order = 1)]
+        public int MaxTradesPerDay { get; set; } = 4;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Session Start (HHmmss)", GroupName = "Session", Order = 2)]
+        public int SessionStart { get; set; } = 93000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Session End (HHmmss)", GroupName = "Session", Order = 3)]
+        public int SessionEnd { get; set; } = 160000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Hard Flatten Time (HHmmss)", GroupName = "Session", Order = 4)]
+        public int HardFlattenTime { get; set; } = 155900;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Trailing Drawdown ($)", GroupName = "Risk", Order = 5)]
+        public double MaxTrailingDrawdown { get; set; } = 2200;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Daily Profit Cap ($)", GroupName = "Risk", Order = 6)]
+        public double MaxDailyProfitCap { get; set; } = 4500;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Min ADX for Entry", GroupName = "Signals", Order = 7)]
+        public int MinAdx { get; set; } = 20;
+
+        // ───────── Setup ─────────
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name = "ApexM3_Elite_Final";
+                Description = "Elite ATM-based M3 strategy — eval ready";
+                Calculate = Calculate.OnEachTick;
+                BarsRequiredToTrade = 60;
+                EntriesPerDirection = 1;
+                EntryHandling = EntryHandling.AllEntries;
+                StartBehavior = StartBehavior.WaitUntilFlat;
+                IsExitOnSessionCloseStrategy = false;
+                TraceOrders = true;
+                RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
+                ConnectionLossHandling = ConnectionLossHandling.KeepRunning;
+            }
+            else if (State == State.DataLoaded)
+            {
+                fastEMA = EMA(9);
+                slowEMA = EMA(21);
+                rsi = RSI(14, 3);
+                adx = ADX(14);
+
+                AddChartIndicator(fastEMA);
+                AddChartIndicator(slowEMA);
+                AddChartIndicator(rsi);
+                AddChartIndicator(adx);
+            }
+            else if (State == State.Terminated)
+            {
+                SafeFlatten();
+            }
+        }
+
+        // ───────── Main Logic ─────────
+        protected override void OnBarUpdate()
+        {
+            if (State != State.Realtime || CurrentBar < BarsRequiredToTrade)
+                return;
+
+            DateTime now = Core.Globals.Now;
+            double equity = GetEquity();
+
+            // Warm-up
+            if (realtimeStart == DateTime.MinValue)
+            {
+                realtimeStart = now;
+                return;
+            }
+            if ((now - realtimeStart).TotalSeconds < WarmUpSeconds)
+                return;
+
+            // Daily reset
+            if (!realtimeInitialized || currentDay != Time[0].Date)
+            {
+                ResetDaily(equity);
+                realtimeInitialized = true;
+            }
+
+            int t = ToTime(Time[0]);
+
+            // Hard flatten
+            if (!forcedFlatToday && t >= HardFlattenTime)
+            {
+                forcedFlatToday = true;
+                SafeFlatten();
+                return;
+            }
+            if (forcedFlatToday) return;
+
+            // RTH + Peak hours only (9:30–11:30)
+            if (t < SessionStart || t > SessionEnd) return;
+            if (t < 93000 || t > 113000) return;
+
+            // Risk halt
+            if (IsHalted(equity))
+            {
+                SafeFlatten();
+                return;
+            }
+
+            // ATM active guard
+            if (!string.IsNullOrEmpty(activeAtmId))
+            {
+                if (GetAtmStrategyMarketPosition(activeAtmId) == MarketPosition.Flat)
+                    activeAtmId = string.Empty;
+                else
+                    return;
+            }
+
+            if (atmPending) return;
+
+            // Cooldowns
+            if ((now - lastSubmitTime).TotalSeconds < AntiBurstSeconds) return;
+            if (lastEntryBar >= 0 && CurrentBar - lastEntryBar < 8) return;
+
+            if (tradesToday >= MaxTradesPerDay) return;
+
+            // ───────── Signal ─────────
+            double volSma = SMA(Volume, 20)[0];
+            if (volSma <= 0) return;
+
+            double mood = fastEMA[0] - slowEMA[0];
+            double volSpike = Volume[0] / volSma;
+            bool trending = adx[0] > MinAdx;
+
+            // ✅ FINAL LOOSENED LOGIC
+            bool goLong  = trending && mood > 0.09 && rsi[0] > 48 && volSpike > 1.35;
+            bool goShort = trending && mood < -0.09 && rsi[0] < 52 && volSpike > 1.35;
+
+            if (goLong || goShort)
+            {
+                atmPending = true;
+                lastSubmitTime = now;
+
+                string atmId = "Elite_" + now.Ticks;
+
+                AtmStrategyCreate(
+                    goLong ? OrderAction.Buy : OrderAction.SellShort,
+                    OrderType.Market,
+                    0, 0,
+                    TimeInForce.Day,
+                    atmId,
+                    "TP_SL_M3",
+                    atmId,
+                    (errorCode, callbackId) =>
+                    {
+                        atmPending = false;
+                        if (errorCode == ErrorCode.NoError)
+                        {
+                            activeAtmId = callbackId;
+                            tradesToday++;
+                            lastEntryBar = CurrentBar;
+                        }
+                    });
+            }
+        }
+
+        // ───────── Helpers ─────────
+        private void ResetDaily(double equity)
+        {
+            currentDay = Time[0].Date;
+            dayStartEquity = equity;
+            dayHighWatermark = equity;
+            tradesToday = 0;
+            lastEntryBar = -1;
+            activeAtmId = string.Empty;
+            atmPending = false;
+            forcedFlatToday = false;
+            realtimeStart = DateTime.MinValue;
+            lastSubmitTime = DateTime.MinValue;
+        }
+
+        private bool IsHalted(double equity)
+        {
+            if (equity > dayHighWatermark)
+                dayHighWatermark = equity;
+
+            return (equity - dayHighWatermark <= -MaxTrailingDrawdown)
+                || (equity - dayStartEquity >= MaxDailyProfitCap);
+        }
+
+        private double GetEquity()
+        {
+            try
+            {
+                return EvalStartingBalance
+                     + Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar)
+                     + Account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
+            }
+            catch
+            {
+                return EvalStartingBalance
+                     + SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+            }
+        }
+
+        private void SafeFlatten()
+        {
+            if (string.IsNullOrEmpty(activeAtmId)) return;
+            try { AtmStrategyClose(activeAtmId); } catch { }
+            activeAtmId = string.Empty;
+        }
+    }
+}
