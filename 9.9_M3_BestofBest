@@ -18,81 +18,71 @@ namespace NinjaTrader.NinjaScript.Strategies
         private RSI rsi;
         private ADX adx;
 
-        // ── ATM Management ───────────────────────────────────────────────────
+        // ── ATM & State ──────────────────────────────────────────────────────
         private string activeAtmId = string.Empty;
         private bool atmPending = false;
-
-        // ── Timing & Guards ──────────────────────────────────────────────────
         private DateTime realtimeStart = DateTime.MinValue;
         private DateTime lastSubmitTime = DateTime.MinValue;
         private int lastEntryBar = -1;
 
-        private const int WarmUpSeconds = 8;
-        private const int AntiBurstSeconds = 60;
-
-        // ── Daily State ──────────────────────────────────────────────────────
+        // ── Daily Reset & Locks ──────────────────────────────────────────────
         private DateTime currentDay = DateTime.MinValue;
         private double dayStartEquity = 0;
         private double dayHighWatermark = 0;
         private int tradesToday = 0;
         private bool forcedFlatToday = false;
+        private bool dailyProfitLocked = false;
         private bool realtimeInitialized = false;
+        private const double DailyProfitLockLevel = 400;   // Flatten & pause at +$400
+        private const double DailyProfitReEnableLevel = 700; // Re-enable if runners hit +$700
 
-        // ── User Parameters ──────────────────────────────────────────────────
+        // ── Parameters ───────────────────────────────────────────────────────
         [NinjaScriptProperty]
         [Display(Name = "Eval Starting Balance ($)", GroupName = "Risk", Order = 0)]
         public double EvalStartingBalance { get; set; } = 100000;
 
         [NinjaScriptProperty]
         [Display(Name = "Max Trades Per Day", GroupName = "Risk", Order = 1)]
-        public int MaxTradesPerDay { get; set; } = 4;
+        public int MaxTradesPerDay { get; set; } = 10;
 
         [NinjaScriptProperty]
         [Display(Name = "Session Start (HHmmss)", GroupName = "Session", Order = 2)]
         public int SessionStart { get; set; } = 93000;
 
         [NinjaScriptProperty]
-        [Display(Name = "Session End (HHmmss)", GroupName = "Session", Order = 3)]
-        public int SessionEnd { get; set; } = 160000;
+        [Display(Name = "Peak End (HHmmss)", GroupName = "Session", Order = 3)]
+        public int PeakEnd { get; set; } = 155900; // 11:00 ET — balanced high-edge window
 
         [NinjaScriptProperty]
-        [Display(Name = "Peak Start (HHmmss)", GroupName = "Session", Order = 4)]
-        public int PeakStart { get; set; } = 93000;
-
-        [NinjaScriptProperty]
-        [Display(Name = "Peak End (HHmmss)", GroupName = "Session", Order = 5)]
-        public int PeakEnd { get; set; } = 113000;
-
-        [NinjaScriptProperty]
-        [Display(Name = "Hard Flatten Time (HHmmss)", GroupName = "Session", Order = 6)]
+        [Display(Name = "Hard Flatten Time (HHmmss)", GroupName = "Session", Order = 4)]
         public int HardFlattenTime { get; set; } = 155900;
 
         [NinjaScriptProperty]
-        [Display(Name = "Max Trailing Drawdown ($)", GroupName = "Risk", Order = 7)]
+        [Display(Name = "Max Trailing Drawdown ($)", GroupName = "Risk", Order = 5)]
         public double MaxTrailingDrawdown { get; set; } = 2200;
 
         [NinjaScriptProperty]
-        [Display(Name = "Daily Profit Cap ($)", GroupName = "Risk", Order = 8)]
+        [Display(Name = "Daily Profit Cap ($)", GroupName = "Risk", Order = 6)]
         public double MaxDailyProfitCap { get; set; } = 4500;
 
         [NinjaScriptProperty]
-        [Display(Name = "Min ADX for Entry", GroupName = "Signals", Order = 9)]
-        public int MinAdx { get; set; } = 20;
+        [Display(Name = "Min ADX for Entry", GroupName = "Signals", Order = 7)]
+        public int MinAdx { get; set; } = 19;
 
         [NinjaScriptProperty]
-        [Display(Name = "Mood Threshold", GroupName = "Signals", Order = 10)]
-        public double MoodThreshold { get; set; } = 0.09;
+        [Display(Name = "Mood Threshold", GroupName = "Signals", Order = 8)]
+        public double MoodThreshold { get; set; } = 0.08;
 
         [NinjaScriptProperty]
-        [Display(Name = "Vol Spike Threshold", GroupName = "Signals", Order = 11)]
-        public double VolSpikeThreshold { get; set; } = 1.35;
+        [Display(Name = "Vol Spike Threshold", GroupName = "Signals", Order = 9)]
+        public double VolSpikeThreshold { get; set; } = 1.3;
 
         [NinjaScriptProperty]
-        [Display(Name = "Cooldown Bars", GroupName = "Guards", Order = 12)]
-        public int CooldownBars { get; set; } = 8;
+        [Display(Name = "Cooldown Bars", GroupName = "Guards", Order = 10)]
+        public int CooldownBars { get; set; } = 6;
 
         [NinjaScriptProperty]
-        [Display(Name = "ATM Template Name", GroupName = "ATM", Order = 13)]
+        [Display(Name = "ATM Template Name", GroupName = "ATM", Order = 11)]
         public string AtmTemplateName { get; set; } = "TP_SL_M3";
 
         // ── Setup ────────────────────────────────────────────────────────────
@@ -101,16 +91,13 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (State == State.SetDefaults)
             {
                 Name = "M3_Eval";
-                Description = "ATM + peak hours + ADX filter + 4 trades max (balanced triggers)";
-
+                Description = "Aggressive open-hour hybrid — eval-ready, dynamic size, profit lock";
                 Calculate = Calculate.OnEachTick;
                 BarsRequiredToTrade = 60;
-
                 EntriesPerDirection = 1;
                 EntryHandling = EntryHandling.AllEntries;
                 StartBehavior = StartBehavior.WaitUntilFlat;
                 IsExitOnSessionCloseStrategy = false;
-
                 TraceOrders = true;
                 RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
                 ConnectionLossHandling = ConnectionLossHandling.KeepRunning;
@@ -119,9 +106,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 fastEMA = EMA(9);
                 slowEMA = EMA(21);
-                rsi    = RSI(14, 3);
-                adx    = ADX(14);
-
+                rsi = RSI(14, 3);
+                adx = ADX(14);
                 AddChartIndicator(fastEMA);
                 AddChartIndicator(slowEMA);
                 AddChartIndicator(rsi);
@@ -129,7 +115,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             }
             else if (State == State.Terminated)
             {
-                SafeFlatten("Terminated");
+                SafeFlatten("Strategy Terminated");
             }
         }
 
@@ -142,16 +128,16 @@ namespace NinjaTrader.NinjaScript.Strategies
             DateTime now = Core.Globals.Now;
             double equity = GetEquity();
 
-            // Warm-up after enabling
+            // Warm-up
             if (realtimeStart == DateTime.MinValue)
             {
                 realtimeStart = now;
                 return;
             }
-            if ((now - realtimeStart).TotalSeconds < WarmUpSeconds)
+            if ((now - realtimeStart).TotalSeconds < 8)
                 return;
 
-            // Daily reset
+            // Daily reset & profit lock reset
             if (!realtimeInitialized || currentDay != Time[0].Date)
             {
                 ResetDaily(equity);
@@ -164,26 +150,37 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (!forcedFlatToday && t >= HardFlattenTime)
             {
                 forcedFlatToday = true;
-                SafeFlatten("EOD");
+                SafeFlatten("EOD Hard Flatten");
                 return;
             }
-            if (forcedFlatToday)
-                return;
+            if (forcedFlatToday) return;
 
-            // RTH + Peak window gate
-            if (t < SessionStart || t > SessionEnd)
-                return;
-            if (t < PeakStart || t > PeakEnd)
-                return;
+            // Peak hours only (9:30–11:00 ET)
+            if (t < SessionStart || t > PeakEnd) return;
 
             // Risk halt
             if (IsHalted(equity))
             {
-                SafeFlatten("RiskHalt");
+                SafeFlatten("Risk Limit Hit");
                 return;
             }
 
-            // Only one ATM active at a time
+            // Daily profit lock
+            double currentDailyPnL = equity - dayStartEquity;
+            if (dailyProfitLocked && currentDailyPnL >= 700)
+            {
+                dailyProfitLocked = false;
+                Print($"{Time[0]:HH:mm:ss} | PROFIT RE-ENABLE | PnL={currentDailyPnL:F2}");
+            }
+            if (!dailyProfitLocked && currentDailyPnL >= 400)
+            {
+                SafeFlatten("Daily Profit Lock");
+                dailyProfitLocked = true;
+                Print($"{Time[0]:HH:mm:ss} | DAILY PROFIT LOCK HIT | PnL={currentDailyPnL:F2}");
+            }
+            if (dailyProfitLocked) return;
+
+            // ATM active guard
             if (!string.IsNullOrEmpty(activeAtmId))
             {
                 if (GetAtmStrategyMarketPosition(activeAtmId) == MarketPosition.Flat)
@@ -191,44 +188,33 @@ namespace NinjaTrader.NinjaScript.Strategies
                 else
                     return;
             }
+            if (atmPending) return;
 
-            if (atmPending)
-                return;
+            // Anti-burst + cooldown
+            if ((now - lastSubmitTime).TotalSeconds < 60) return;
+            if (lastEntryBar >= 0 && CurrentBar - lastEntryBar < CooldownBars) return;
+            if (tradesToday >= MaxTradesPerDay) return;
 
-            // Anti-burst + cooldown bars
-            if ((now - lastSubmitTime).TotalSeconds < AntiBurstSeconds)
-                return;
-            if (lastEntryBar >= 0 && CurrentBar - lastEntryBar < CooldownBars)
-                return;
-
-            if (tradesToday >= MaxTradesPerDay)
-                return;
-
-            // ── Signal ───────────────────────────────────────────────────────
+            // Signal — aggressive open-hour hunter
             double volSma = SMA(Volume, 20)[0];
-            if (volSma <= 0)
-                return;
-
+            if (volSma <= 0) return;
             double mood = fastEMA[0] - slowEMA[0];
             double volSpike = Volume[0] / volSma;
             bool trending = adx[0] >= MinAdx;
+            bool goLong = trending && mood > MoodThreshold && rsi[0] > 46 && volSpike >= VolSpikeThreshold;
+            bool goShort = trending && mood < -MoodThreshold && rsi[0] < 54 && volSpike >= VolSpikeThreshold;
 
-            // Balanced loosening:
-            // Long: RSI > 48, Short: RSI < 52
-            bool goLong  = trending && mood >  MoodThreshold && rsi[0] > 48 && volSpike >= VolSpikeThreshold;
-            bool goShort = trending && mood < -MoodThreshold && rsi[0] < 52 && volSpike >= VolSpikeThreshold;
+            if (!(goLong || goShort)) return;
 
-            if (!(goLong || goShort))
-                return;
+            // Dynamic sizing (0.5% risk per trade)
+            int qty = GetDynamicContracts(equity);
 
-            // Fire ATM
             atmPending = true;
             lastSubmitTime = now;
+            string ocoId = "Canon_" + now.Ticks;
+            string atmStrategyId = "CanonATM_" + now.Ticks;
 
-            string ocoId = "M3OCO_" + now.Ticks;
-            string atmStrategyId = "M3ATM_" + now.Ticks;
-
-            Print($"{Time[0]:HH:mm:ss} | SIGNAL {(goLong ? "LONG" : "SHORT")} | mood={mood:F3} rsi={rsi[0]:F1} adx={adx[0]:F1} volSpike={volSpike:F2}");
+            Print($"{Time[0]:HH:mm:ss} | SIGNAL {(goLong ? "LONG" : "SHORT")} | mood={mood:F3} rsi={rsi[0]:F1} adx={adx[0]:F1} volSpike={volSpike:F2} qty={qty}");
 
             AtmStrategyCreate(
                 goLong ? OrderAction.Buy : OrderAction.SellShort,
@@ -241,7 +227,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                 (errorCode, callbackId) =>
                 {
                     atmPending = false;
-
                     if (errorCode == ErrorCode.NoError)
                     {
                         activeAtmId = callbackId;
@@ -262,14 +247,12 @@ namespace NinjaTrader.NinjaScript.Strategies
             currentDay = Time[0].Date;
             dayStartEquity = equity;
             dayHighWatermark = equity;
-
             tradesToday = 0;
             lastEntryBar = -1;
-
             activeAtmId = string.Empty;
             atmPending = false;
-
             forcedFlatToday = false;
+            dailyProfitLocked = false;
             realtimeStart = DateTime.MinValue;
             lastSubmitTime = DateTime.MinValue;
         }
@@ -278,10 +261,8 @@ namespace NinjaTrader.NinjaScript.Strategies
         {
             if (equity > dayHighWatermark)
                 dayHighWatermark = equity;
-
             double trailDD = equity - dayHighWatermark;
             double dayPnL = equity - dayStartEquity;
-
             return trailDD <= -MaxTrailingDrawdown || dayPnL >= MaxDailyProfitCap;
         }
 
@@ -290,24 +271,31 @@ namespace NinjaTrader.NinjaScript.Strategies
             try
             {
                 return EvalStartingBalance
-                    + Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar)
-                    + Account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
+                     + Account.Get(AccountItem.RealizedProfitLoss, Currency.UsDollar)
+                     + Account.Get(AccountItem.UnrealizedProfitLoss, Currency.UsDollar);
             }
             catch
             {
                 return EvalStartingBalance
-                    + SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+                     + SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
             }
+        }
+
+        private int GetDynamicContracts(double equity)
+        {
+            double riskPerTrade = equity * 0.005; // 0.5% risk
+            double contractRisk = 24 * TickSize * Instrument.MasterInstrument.PointValue; // 24-tick SL
+            int qty = (int)(riskPerTrade / contractRisk);
+            qty = Math.Max(6, qty);  // min 6c
+            qty = Math.Min(15, qty); // Apex cap
+            return qty;
         }
 
         private void SafeFlatten(string reason)
         {
-            if (string.IsNullOrEmpty(activeAtmId))
-                return;
-
+            if (string.IsNullOrEmpty(activeAtmId)) return;
             try { AtmStrategyClose(activeAtmId); }
             catch { }
-
             Print($"{Time[0]:HH:mm:ss} | SAFE FLATTEN | {reason}");
             activeAtmId = string.Empty;
         }
