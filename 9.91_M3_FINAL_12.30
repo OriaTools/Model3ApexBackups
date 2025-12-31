@@ -1,0 +1,352 @@
+#region Using declarations
+using System;
+using System.ComponentModel.DataAnnotations;
+using NinjaTrader.Cbi;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.NinjaScript.Indicators;
+using NinjaTrader.Core;
+#endregion
+
+// ==================================================================
+// M3_Eval — EVAL-OPTIMIZED CLEAN VERSION (Apex 100K) with ATM
+// ------------------------------------------------------------------
+// • 4 contracts hard-locked
+// • Max 3 trades/day (adjustable)
+// • Uses ATM template for partials, SL, TP, trailing
+// • Partial @ +12 ticks (in ATM)
+// • SL 55 ticks initial (in ATM)
+// • TP 300 ticks (in ATM)
+// • Profit lock +39 → +25 (manual in code, ATM handles trailing)
+// • 180s time stop (real-time)
+// • RTH only + HARD FLATTEN 15:59:00 ET
+// ==================================================================
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+    public class M3_Eval : Strategy
+    {
+        private EMA fastEMA;
+        private EMA slowEMA;
+        private RSI rsi;
+
+        private const int Contracts = 4;
+
+        private DateTime currentDay = DateTime.MinValue;
+        private double dayStartEquity = 0;
+        private double dayHighWatermark = 0;
+        private bool profitLockedToday = false;
+
+        private int tradesToday = 0;
+        private DateTime lastEntryFillTime = DateTime.MinValue;
+        private string lastCountedEntryOrderId = string.Empty;
+
+        // --- ATM & State ---
+        private string activeAtmId = string.Empty;
+        private bool atmPending = false;
+
+        // --- Entry gating ---
+        private bool entryLocked = false;
+        private DateTime entrySubmitTime = DateTime.MinValue;
+
+        // --- Per-trade guards ---
+        private bool partialTakenThisTrade = false;
+        private bool stopAdjustedThisTrade = false;
+        private bool profitLockMovedThisTrade = false;
+
+        // --- Daily guards ---
+        private bool realtimeInitialized = false;
+        private bool forcedFlatToday = false;
+
+        // ---------------- PARAMETERS ----------------
+        [NinjaScriptProperty]
+        [Display(Name = "Max Trades Per Day", GroupName = "Risk", Order = 1)]
+        public int MaxTradesPerDay { get; set; } = 30;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Session Start (HHmmss)", GroupName = "Session", Order = 2)]
+        public int SessionStart { get; set; } = 93000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Session End (HHmmss)", GroupName = "Session", Order = 3)]
+        public int SessionEnd { get; set; } = 170000;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Hard Flatten Time (HHmmss)", GroupName = "Session", Order = 4)]
+        public int HardFlattenTime { get; set; } = 165900; // 16:59:00
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Trailing Drawdown ($)", GroupName = "Risk", Order = 5)]
+        public double MaxTrailingDrawdown { get; set; } = 2500;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Max Daily Profit Cap ($)", GroupName = "Risk", Order = 6)]
+        public double MaxDailyProfitCap { get; set; } = 1200;
+
+        // --- Runner profit lock (ONE move only) ---
+        [NinjaScriptProperty]
+        [Display(Name = "Profit Lock Trigger (ticks)", GroupName = "Runner", Order = 7)]
+        public int ProfitLockTriggerTicks { get; set; } = 39;
+
+        [NinjaScriptProperty]
+        [Display(Name = "Profit Lock Ticks (runner)", GroupName = "Runner", Order = 8)]
+        public int ProfitLockTicks { get; set; } = 25;
+
+        // --- ATM Template Name ---
+        [NinjaScriptProperty]
+        [Display(Name = "ATM Template Name", GroupName = "ATM", Order = 9)]
+        public string AtmTemplateName { get; set; } = "M3_ATM_Strategy";  // Change to match your template
+
+        // --- Timing helpers ---
+        private DateTime Now()
+        {
+            return (State == State.Realtime ? Core.Globals.Now : Time[0]);
+        }
+
+        protected override void OnStateChange()
+        {
+            if (State == State.SetDefaults)
+            {
+                Name = "M3_Eval";
+                Calculate = Calculate.OnEachTick;
+                EntriesPerDirection = 1;
+                EntryHandling = EntryHandling.AllEntries;
+                BarsRequiredToTrade = 50;
+                IsExitOnSessionCloseStrategy = true;
+                ExitOnSessionCloseSeconds = 30;
+                RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
+                ConnectionLossHandling = ConnectionLossHandling.KeepRunning;
+                TraceOrders = true;
+            }
+            else if (State == State.DataLoaded)
+            {
+                fastEMA = EMA(9);
+                slowEMA = EMA(21);
+                rsi = RSI(14, 3);
+                AddChartIndicator(fastEMA);
+                AddChartIndicator(slowEMA);
+                AddChartIndicator(rsi);
+            }
+        }
+
+        protected override void OnBarUpdate()
+        {
+            if (CurrentBar < BarsRequiredToTrade)
+                return;
+
+            DateTime now = Now();
+            double equity = GetEquitySafe();
+
+            if (State == State.Realtime && !realtimeInitialized)
+            {
+                ResetDailyState(equity);
+                realtimeInitialized = true;
+            }
+
+            if (currentDay != Time[0].Date)
+                ResetDailyState(equity);
+
+            int t = ToTime(Time[0]);
+
+            if (!forcedFlatToday && t >= HardFlattenTime)
+            {
+                forcedFlatToday = true;
+                SafeFlatten();
+                return;
+            }
+            if (forcedFlatToday) return;
+
+            if (t < SessionStart || t > SessionEnd)
+            {
+                SafeFlatten();
+                return;
+            }
+
+            if (IsTradingHalted(equity))
+            {
+                SafeFlatten();
+                return;
+            }
+
+            if (!string.IsNullOrEmpty(activeAtmId))
+            {
+                if (GetAtmStrategyMarketPosition(activeAtmId) == MarketPosition.Flat)
+                    activeAtmId = string.Empty;
+                else
+                    return;
+            }
+
+            if (atmPending) return;
+
+            double volSma = SMA(Volume, 20)[0];
+            if (volSma <= 0) return;
+
+            double mood = fastEMA[0] - slowEMA[0];
+            double volSpike = Volume[0] / volSma;
+
+            bool goLong = mood > 0.05 && rsi[0] > 45 && volSpike > 1.2;
+            bool goShort = mood < -0.05 && rsi[0] < 55 && volSpike > 1.2;
+
+            // ENTRY with ATM
+            if (Position.MarketPosition == MarketPosition.Flat &&
+                !entryLocked &&
+                tradesToday < MaxTradesPerDay)
+            {
+                if (goLong || goShort)
+                {
+                    entryLocked = true;
+                    entrySubmitTime = now;
+                    ResetPerTradeFlags();
+
+                    atmPending = true;
+                    string atmId = "M3_" + now.Ticks;
+
+                    AtmStrategyCreate(
+                        goLong ? OrderAction.Buy : OrderAction.SellShort,
+                        OrderType.Market,
+                        0, 0,
+                        TimeInForce.Day,
+                        atmId,
+                        AtmTemplateName,
+                        atmId,
+                        (errorCode, callbackId) =>
+                        {
+                            atmPending = false;
+                            if (errorCode == ErrorCode.NoError)
+                            {
+                                activeAtmId = callbackId;
+                                tradesToday++;
+                                lastEntryFillTime = now;
+                            }
+                        });
+                }
+            }
+
+            // FAILSAFE UNLOCK
+            if (entryLocked &&
+                Position.MarketPosition == MarketPosition.Flat &&
+                entrySubmitTime != DateTime.MinValue &&
+                (now - entrySubmitTime).TotalSeconds > 10)
+            {
+                entryLocked = false;
+                entrySubmitTime = DateTime.MinValue;
+            }
+
+            // MANAGEMENT (time stop, profit lock — partials/trailing handled by ATM)
+            if (Position.MarketPosition != MarketPosition.Flat)
+            {
+                // Time stop
+                if (lastEntryFillTime != DateTime.MinValue &&
+                    (now - lastEntryFillTime).TotalSeconds > 180)
+                {
+                    SafeFlatten();
+                    return;
+                }
+
+                // Profit lock (manual on runner after partial — ATM handles partial/trailing)
+                if (partialTakenThisTrade && stopAdjustedThisTrade && !profitLockMovedThisTrade)
+                {
+                    if (Position.MarketPosition == MarketPosition.Long)
+                    {
+                        double triggerPrice = Position.AveragePrice + ProfitLockTriggerTicks * TickSize;
+                        if (High[0] >= triggerPrice)
+                        {
+                            double lockPrice = Position.AveragePrice + ProfitLockTicks * TickSize;
+                            double safe = Math.Min(lockPrice, GetCurrentBid() - 2 * TickSize);
+                            SetStopLoss("M3", CalculationMode.Price, safe, false);
+                            profitLockMovedThisTrade = true;
+                        }
+                    }
+                    else
+                    {
+                        double triggerPrice = Position.AveragePrice - ProfitLockTriggerTicks * TickSize;
+                        if (Low[0] <= triggerPrice)
+                        {
+                            double lockPrice = Position.AveragePrice - ProfitLockTicks * TickSize;
+                            double safe = Math.Max(lockPrice, GetCurrentAsk() + 2 * TickSize);
+                            SetStopLoss("M3", CalculationMode.Price, safe, false);
+                            profitLockMovedThisTrade = true;
+                        }
+                    }
+                }
+            }
+
+            if (Position.MarketPosition == MarketPosition.Flat)
+            {
+                entryLocked = false;
+                entrySubmitTime = DateTime.MinValue;
+                ResetPerTradeFlags();
+            }
+        }
+
+        protected override void OnExecutionUpdate(Execution exec, string id, double price, int qty,
+            MarketPosition mp, string orderId, DateTime time)
+        {
+            if (exec?.Order == null || exec.Order.Name != "M3") return;
+
+            if ((exec.Order.OrderAction == OrderAction.Buy ||
+                 exec.Order.OrderAction == OrderAction.SellShort) &&
+                exec.Order.OrderState == OrderState.Filled &&
+                exec.Order.OrderId != lastCountedEntryOrderId)
+            {
+                lastCountedEntryOrderId = exec.Order.OrderId;
+                tradesToday++;
+                lastEntryFillTime = time;
+            }
+        }
+
+        private void ResetPerTradeFlags()
+        {
+            partialTakenThisTrade = false;
+            stopAdjustedThisTrade = false;
+            profitLockMovedThisTrade = false;
+            lastEntryFillTime = DateTime.MinValue;
+        }
+
+        private void ResetDailyState(double equity)
+        {
+            currentDay = Time[0].Date;
+            dayStartEquity = equity;
+            dayHighWatermark = equity;
+            profitLockedToday = false;
+            tradesToday = 0;
+            lastCountedEntryOrderId = string.Empty;
+            entryLocked = false;
+            entrySubmitTime = DateTime.MinValue;
+            forcedFlatToday = false;
+            ResetPerTradeFlags();
+        }
+
+        private bool IsTradingHalted(double equity)
+        {
+            if (equity > dayHighWatermark + 50)
+                profitLockedToday = true;
+
+            if (equity > dayHighWatermark)
+                dayHighWatermark = equity;
+
+            double dayPnL = equity - dayStartEquity;
+            double trailDD = equity - dayHighWatermark;
+
+            return trailDD <= -MaxTrailingDrawdown || dayPnL >= MaxDailyProfitCap;
+        }
+
+        private double GetEquitySafe()
+        {
+            double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
+            double unreal = Position.MarketPosition != MarketPosition.Flat
+                ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
+                : 0;
+
+            return 100000 + realized + unreal;
+        }
+
+        private void SafeFlatten()
+        {
+            if (string.IsNullOrEmpty(activeAtmId)) return;
+            try { AtmStrategyClose(activeAtmId); }
+            catch { }
+            activeAtmId = string.Empty;
+        }
+    }
+}
