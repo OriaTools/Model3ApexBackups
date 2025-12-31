@@ -12,14 +12,14 @@ using NinjaTrader.Core;
 // M3_Eval — EVAL-OPTIMIZED CLEAN VERSION (Apex 100K) with ATM
 // ------------------------------------------------------------------
 // • 4 contracts hard-locked
-// • Max 3 trades/day (adjustable)
+// • Max 30 trades/day (adjustable)
 // • Uses ATM template for partials, SL, TP, trailing
 // • Partial @ +12 ticks (in ATM)
 // • SL 55 ticks initial (in ATM)
 // • TP 300 ticks (in ATM)
 // • Profit lock +39 → +25 (manual in code, ATM handles trailing)
 // • 180s time stop (real-time)
-// • RTH only + HARD FLATTEN 15:59:00 ET
+// • RTH only + HARD FLATTEN 16:59:00 ET
 // ==================================================================
 
 namespace NinjaTrader.NinjaScript.Strategies
@@ -44,6 +44,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // --- ATM & State ---
         private string activeAtmId = string.Empty;
         private bool atmPending = false;
+        private DateTime realtimeStart = DateTime.MinValue;  // <--- Added for warm-up
 
         // --- Entry gating ---
         private bool entryLocked = false;
@@ -95,7 +96,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // --- ATM Template Name ---
         [NinjaScriptProperty]
         [Display(Name = "ATM Template Name", GroupName = "ATM", Order = 9)]
-        public string AtmTemplateName { get; set; } = "M3_ATM_Strategy";  // Change to match your template
+        public string AtmTemplateName { get; set; } = "M3_ATM";  // Your template
 
         // --- Timing helpers ---
         private DateTime Now()
@@ -117,6 +118,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
                 ConnectionLossHandling = ConnectionLossHandling.KeepRunning;
                 TraceOrders = true;
+                StartBehavior = StartBehavior.WaitUntilFlat;  // <--- Added for ATM safety
             }
             else if (State == State.DataLoaded)
             {
@@ -131,20 +133,27 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         protected override void OnBarUpdate()
         {
+            // ===== ATM REALTIME WARM-UP (CRITICAL FIX) =====
+            if (State != State.Realtime)
+                return;
+
+            DateTime now = Core.Globals.Now;
+
+            if (realtimeStart == DateTime.MinValue)
+            {
+                realtimeStart = now;
+                return;
+            }
+
+            if ((now - realtimeStart).TotalSeconds < 5)  // 5-second warm-up
+                return;
+
             if (CurrentBar < BarsRequiredToTrade)
                 return;
 
-            DateTime now = Now();
-            double equity = GetEquitySafe();
-
-            if (State == State.Realtime && !realtimeInitialized)
-            {
-                ResetDailyState(equity);
-                realtimeInitialized = true;
-            }
-
+            // ----- Daily reset -----
             if (currentDay != Time[0].Date)
-                ResetDailyState(equity);
+                ResetDailyState(GetEquitySafe());
 
             int t = ToTime(Time[0]);
 
@@ -162,7 +171,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
             }
 
-            if (IsTradingHalted(equity))
+            if (IsTradingHalted(GetEquitySafe()))
             {
                 SafeFlatten();
                 return;
@@ -217,6 +226,12 @@ namespace NinjaTrader.NinjaScript.Strategies
                                 activeAtmId = callbackId;
                                 tradesToday++;
                                 lastEntryFillTime = now;
+                                Print($"ATM START OK | tradesToday={tradesToday} | atmId={activeAtmId}");
+                            }
+                            else
+                            {
+                                Print($"ATM START FAIL | error={errorCode}");
+                                entryLocked = false; // Unlock if ATM fails
                             }
                         });
                 }
@@ -232,7 +247,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 entrySubmitTime = DateTime.MinValue;
             }
 
-            // MANAGEMENT (time stop, profit lock — partials/trailing handled by ATM)
+            // MANAGEMENT (time stop, profit lock — ATM handles partial/trailing)
             if (Position.MarketPosition != MarketPosition.Flat)
             {
                 // Time stop
@@ -243,7 +258,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     return;
                 }
 
-                // Profit lock (manual on runner after partial — ATM handles partial/trailing)
+                // Profit lock (manual override)
                 if (partialTakenThisTrade && stopAdjustedThisTrade && !profitLockMovedThisTrade)
                 {
                     if (Position.MarketPosition == MarketPosition.Long)
