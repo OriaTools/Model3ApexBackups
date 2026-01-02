@@ -47,7 +47,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         // ---------------- PARAMETERS ----------------
         [NinjaScriptProperty]
         [Display(Name = "Max Trades Per Day", GroupName = "Risk", Order = 1)]
-        public int MaxTradesPerDay { get; set; } = 80;
+        public int MaxTradesPerDay { get; set; } = 32;
 
         [NinjaScriptProperty]
         [Display(Name = "Session Start (HHmmss)", GroupName = "Session", Order = 2)]
