@@ -33,7 +33,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool entryLocked = false;
         private DateTime entrySubmitTime = DateTime.MinValue;
 
-        // ================= SIGNAL MEMORY (STACK FIX) =================
+        // ================= SIGNAL MEMORY (ANTI-STACK) =================
         private bool lastRawGoLong = false;
         private bool lastRawGoShort = false;
         private int lastEntryBar = -1;
@@ -131,6 +131,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 entrySubmitTime != DateTime.MinValue &&
                 (now - entrySubmitTime).TotalSeconds > 15)
             {
+                Print("FAILSAFE UNLOCK: ATM create timeout > 15s");
                 entryLocked = false;
                 atmPending = false;
                 entrySubmitTime = DateTime.MinValue;
@@ -163,12 +164,18 @@ namespace NinjaTrader.NinjaScript.Strategies
                 }
                 else
                 {
-                    return;
+                    return; // ATM still managing a live position
                 }
             }
 
+            // Cooldown after ATM completes
             if (lastAtmFlatTime != DateTime.MinValue &&
                 (now - lastAtmFlatTime).TotalSeconds < 30)
+                return;
+
+            // ================= EXECUTION-LEVEL ANTI-STACKING GUARD =================
+            // ATM state can lag; Position is the authoritative truth
+            if (Position.MarketPosition != MarketPosition.Flat)
                 return;
 
             if (atmPending || entryLocked)
@@ -192,7 +199,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             bool rawGoLong  = mood >  0.05 && rsi[0] > 45 && volSpike > 1.2;
             bool rawGoShort = mood < -0.05 && rsi[0] < 55 && volSpike > 1.2;
 
-            // ===== EDGE DETECTION (NO STACKING) =====
+            // ===== EDGE DETECTION (NO SIGNAL-LEVEL STACKING) =====
             bool goLong  = rawGoLong  && !lastRawGoLong;
             bool goShort = rawGoShort && !lastRawGoShort;
 
@@ -233,6 +240,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                         activeAtmId = callbackId;
                         tradesToday++;
                         Print($"DAY ATM START OK | tradesToday={tradesToday}");
+                    }
+                    else
+                    {
+                        Print($"DAY ATM START FAIL | error={errorCode}");
                     }
 
                     entryLocked = false;
