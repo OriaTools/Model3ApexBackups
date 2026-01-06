@@ -5,7 +5,6 @@ using NinjaTrader.Cbi;
 using NinjaTrader.Data;
 using NinjaTrader.NinjaScript;
 using NinjaTrader.NinjaScript.Indicators;
-using NinjaTrader.Core;
 #endregion
 
 namespace NinjaTrader.NinjaScript.Strategies
@@ -45,7 +44,7 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         [NinjaScriptProperty]
         [Display(Name = "Last Entry Time (HHmmss)", GroupName = "Session", Order = 3)]
-        public int LastEntryTime { get; set; } = 150000; // 3:00 PM
+        public int LastEntryTime { get; set; } = 145500; // ✅ recommended 2:55 PM (was 3:00 PM)
 
         [NinjaScriptProperty]
         [Display(Name = "Hard Flatten Time (HHmmss)", GroupName = "Session", Order = 4)]
@@ -72,7 +71,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 Calculate = Calculate.OnEachTick;
 
                 EntriesPerDirection = 1;
-                EntryHandling = EntryHandling.AllEntries;
+                EntryHandling = EntryHandling.UniqueEntries; // ✅ prevents stacking
                 BarsRequiredToTrade = 50;
 
                 StartBehavior = StartBehavior.WaitUntilFlat;
@@ -80,7 +79,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 IsExitOnSessionCloseStrategy = true;
                 ExitOnSessionCloseSeconds = 30;
 
-                RealtimeErrorHandling = RealtimeErrorHandling.IgnoreAllErrors;
+                RealtimeErrorHandling = RealtimeErrorHandling.StopCancelClose; // ✅ don't hide critical order errors
                 ConnectionLossHandling = ConnectionLossHandling.KeepRunning;
 
                 TraceOrders = true;
@@ -104,7 +103,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                 return;
 
             DateTime now = Core.Globals.Now;
-            int t = ToTime(Time[0]);
+            int tNow = ToTime(now); // ✅ use real clock time (not Time[0])
 
             // --- Warm-up ---
             if (realtimeStart == DateTime.MinValue)
@@ -122,8 +121,19 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (currentDay != Time[0].Date)
                 ResetDailyState(GetEquitySafe());
 
-            // --- HARD FLATTEN (ONLY place that force-closes) ---
-            if (!forcedFlatToday && t >= HardFlattenTime)
+            // ✅ FAILSAFE UNLOCK MUST RUN BEFORE early returns
+            if (entryLocked &&
+                entrySubmitTime != DateTime.MinValue &&
+                (now - entrySubmitTime).TotalSeconds > 15)
+            {
+                Print("FAILSAFE UNLOCK: ATM create timeout > 15s");
+                entryLocked = false;
+                atmPending = false;
+                entrySubmitTime = DateTime.MinValue;
+            }
+
+            // --- HARD FLATTEN ---
+            if (!forcedFlatToday && tNow >= HardFlattenTime)
             {
                 forcedFlatToday = true;
                 SafeFlatten();
@@ -166,8 +176,8 @@ namespace NinjaTrader.NinjaScript.Strategies
             // ==================================================
             // ENTRY WINDOW (no flattening here)
             // ==================================================
-            if (t < SessionStart || t > LastEntryTime)
-                return;   // ❗ NO NEW ENTRIES, but ATM may continue
+            if (tNow < SessionStart || tNow > LastEntryTime)
+                return;   // NO NEW ENTRIES, but ATM may continue
 
             if (tradesToday >= MaxTradesPerDay)
                 return;
@@ -220,16 +230,6 @@ namespace NinjaTrader.NinjaScript.Strategies
                     entryLocked = false;
                     entrySubmitTime = DateTime.MinValue;
                 });
-
-            // --- failsafe unlock ---
-            if (entryLocked &&
-                entrySubmitTime != DateTime.MinValue &&
-                (now - entrySubmitTime).TotalSeconds > 15)
-            {
-                entryLocked = false;
-                atmPending = false;
-                entrySubmitTime = DateTime.MinValue;
-            }
         }
 
         // ================= HELPERS =================
@@ -262,12 +262,20 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private double GetEquitySafe()
         {
+            try
+            {
+                if (Account != null)
+                    return Account.Get(AccountItem.NetLiquidation, Currency.UsDollar);
+            }
+            catch { }
+
+            // fallback
             double realized = SystemPerformance.AllTrades.TradesPerformance.Currency.CumProfit;
             double unreal = Position.MarketPosition != MarketPosition.Flat
                 ? Position.GetUnrealizedProfitLoss(PerformanceUnit.Currency)
                 : 0;
 
-            return 100000 + realized + unreal;
+            return realized + unreal;
         }
 
         private void SafeFlatten()
