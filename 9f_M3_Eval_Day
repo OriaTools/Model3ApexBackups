@@ -24,7 +24,7 @@ namespace NinjaTrader.NinjaScript.Strategies
         private bool forcedFlatToday = false;
 
         // ================= ATM STATE =================
-        private string sessionAtmId = string.Empty;      // Persistent single ATM ID per day
+        private string activeAtmId = string.Empty;      // Tracks the current live ATM only
         private bool atmPending = false;
         private DateTime lastAtmFlatTime = DateTime.MinValue;
 
@@ -137,7 +137,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (postFlattenLockUntil > now) return;
 
             // Unmanaged recovery
-            if (string.IsNullOrEmpty(sessionAtmId) && Position.MarketPosition != MarketPosition.Flat && !unmanagedDetected)
+            if (string.IsNullOrEmpty(activeAtmId) && Position.MarketPosition != MarketPosition.Flat && !unmanagedDetected)
             {
                 unmanagedDetected = true;
                 Print($"UNMANAGED DETECTED: {Position.MarketPosition} qty={Position.Quantity}");
@@ -174,25 +174,25 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (forcedFlatToday) return;
             if (IsTradingHalted(GetEquitySafe())) { SafeFlattenAll(); return; }
 
-            // Single ATM lifecycle guard (using persistent ID)
-            if (!string.IsNullOrEmpty(sessionAtmId))
+            // Current ATM lifecycle guard
+            if (!string.IsNullOrEmpty(activeAtmId))
             {
-                MarketPosition atmPos = GetAtmStrategyMarketPosition(sessionAtmId);
+                MarketPosition atmPos = GetAtmStrategyMarketPosition(activeAtmId);
                 if (atmPos == MarketPosition.Flat)
                 {
-                    sessionAtmId = string.Empty;
+                    activeAtmId = string.Empty;
                     lastAtmFlatTime = now;
                 }
                 else
                 {
-                    return; // Single ATM still live — block new entry
+                    return; // Current ATM still live — block new entry
                 }
             }
 
             // Cooldown after flat
             if (lastAtmFlatTime != DateTime.MinValue && (now - lastAtmFlatTime).TotalSeconds < 30) return;
 
-            // Final safety: no position, no pending
+            // Final safety
             if (Position.Quantity != 0 || atmPending || entryLocked) return;
 
             // Entry window & trade limit
@@ -218,25 +218,28 @@ namespace NinjaTrader.NinjaScript.Strategies
             if (lastEntryBar != -1 && CurrentBar - lastEntryBar < 5) return;
             lastEntryBar = CurrentBar;
 
-            // Submit ATM with persistent session ID
+            // Submit ATM with UNIQUE ID per entry
             entryLocked = true;
             entrySubmitTime = now;
             atmPending = true;
+
+            string atmId = "M3ATM_" + now.Ticks.ToString();  // Unique every time
+            string ocoId = "M3OCO_" + atmId;
 
             AtmStrategyCreate(
                 goLong ? OrderAction.Buy : OrderAction.SellShort,
                 OrderType.Market,
                 0, 0,
                 TimeInForce.Day,
-                "M3OCO_Day",
+                ocoId,
                 AtmTemplateName,
-                sessionAtmId,
+                atmId,
                 (errorCode, callbackId) =>
                 {
                     atmPending = false;
                     if (errorCode == ErrorCode.NoError)
                     {
-                        sessionAtmId = callbackId;  // Will be same as requested
+                        activeAtmId = callbackId;
                         tradesToday++;
                         Print($"ATM START OK | tradesToday={tradesToday}");
                     }
@@ -258,8 +261,7 @@ namespace NinjaTrader.NinjaScript.Strategies
             tradesToday = 0;
             forcedFlatToday = false;
 
-            sessionAtmId = "M3ATM_Day_" + currentDay.ToString("yyyyMMdd");  // Persistent ID per day
-
+            activeAtmId = string.Empty;
             atmPending = false;
             entryLocked = false;
             lastAtmFlatTime = DateTime.MinValue;
@@ -291,10 +293,10 @@ namespace NinjaTrader.NinjaScript.Strategies
 
         private void SafeFlattenAll()
         {
-            if (!string.IsNullOrEmpty(sessionAtmId))
+            if (!string.IsNullOrEmpty(activeAtmId))
             {
-                try { AtmStrategyClose(sessionAtmId); } catch { }
-                sessionAtmId = string.Empty;
+                try { AtmStrategyClose(activeAtmId); } catch { }
+                activeAtmId = string.Empty;
             }
 
             if (Account != null)
